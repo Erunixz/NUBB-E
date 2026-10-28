@@ -1,0 +1,23 @@
+# --- Claude / AI assistant files (kept local, never on GitHub) ---
+CLAUDE.md
+CLAUDE.local.md
+.build_plan.MD
+.claude/
+
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- Big model and voice files ---
+models/
+voices/
+*.gguf
+*.onnx
+*.onnx.json
+*.safetensors
+
+# --- Logs and local data ---
+*.log
+.nubbe/
