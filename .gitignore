@@ -11,6 +11,7 @@ __pycache__/
 .pytest_cache/
 
 # --- Big model and voice files ---
+bin/
 models/
 voices/
 *.gguf
