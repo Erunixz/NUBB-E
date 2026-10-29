@@ -23,6 +23,18 @@ Flags:
   --no-brain    don't start llama-server (you run it yourself)
   --browser     open in your normal browser instead of an app window
   --no-window   don't open a window, just serve the page
+  --background  start with no app window, just the quick bar
+
+Quick bar (Windows, pip install pywebview): press Alt+Space (quick_hotkey in
+config.toml) from any app for a small see-through bar on top. Type and press
+Enter, or Ctrl+Enter to Look at the screen behind it. Insert pastes the answer
+where your cursor was. Esc hides it. Closing the app window keeps NUBB-E
+running for the quick bar; quit from the bar's x button.
+
+Look button: NUBB-E takes a screenshot (its own window hides for a moment)
+and answers your question about it. Needs `pip install mss pillow` and the
+mmproj vision file set in config.toml. Only "[screenshot]" is saved in the
+chat, never the image itself.
 """
 import argparse
 import atexit
@@ -59,6 +71,7 @@ DATA_DIR = Path.home() / ".nubbe"
 DB_PATH = DATA_DIR / "nubbe.db"
 PROMPT_PATH = HERE / "nubbe_system_prompt.txt"
 from nubbe_face import FACE_JS, FACE_STATES   # shared face engine (keep nubbe_face.py next to this file)
+from nubbe_quick import QUICK_PAGE            # quick bar page (keep nubbe_quick.py next to this file)
 
 VOICE_RULES = (
     "\n\n## Voice mode\n"
@@ -91,7 +104,15 @@ CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, text TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
 DEFAULT_SETTINGS = {"auto_memory": "1", "think": "0"}   # Fast by default: Smart thinks first, which is slow
-CHAT_SLOT, MEMORY_SLOT = 0, 1   # fixed brain slots, so each keeps its prompt cached
+CHAT_SLOT, MEMORY_SLOT, LOOK_SLOT = 0, 1, 2   # fixed brain slots, so each keeps its prompt cached
+VISION = bool(CFG["brain"].get("mmproj"))
+
+
+def take_screenshot(monitor: int = 1, width: int = 1280) -> str:
+    """Screenshot as base64 JPEG, with the NUBB-E window hidden while it's taken (see look.py)."""
+    from look import hidden_window, screenshot_b64
+    with hidden_window():
+        return screenshot_b64(monitor, width)
 
 
 def connect() -> sqlite3.Connection:
@@ -451,8 +472,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif path == "/":
-            body = PAGE.encode()
+        elif path in ("/", "/quick"):
+            body = (PAGE if path == "/" else QUICK_PAGE).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -486,6 +507,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/chat":
             self.chat(body)
+        elif path == "/api/look":
+            self.chat(body, look=True)
         elif path == "/state":  # set_face() from other scripts
             if body.get("state") not in FACE_STATES:
                 self.send_error(400)
@@ -534,19 +557,41 @@ class Handler(BaseHTTPRequestHandler):
                 if q in _clients:
                     _clients.remove(q)
 
-    def chat(self, body: dict):
+    def chat(self, body: dict, look: bool = False):
         text = str(body.get("message", "")).strip()
+        if look:
+            text = text or "What's on my screen?"
         if not text:
             self.send_error(400)
             return
         voice = bool(body.get("voice"))      # from nubbe_voice.py: short spoken replies
+        image = None
+        if look:   # capture first, so it's the screen as it was when Erfan asked
+            try:
+                if not VISION:
+                    raise RuntimeError("My eyes are off. Set mmproj in config.toml to turn vision on.")
+                image = take_screenshot(int(body.get("monitor", 1)), int(body.get("width", 1280)))
+            except Exception as e:
+                msg = str(e) if isinstance(e, (RuntimeError, ValueError)) else f"I couldn't take a screenshot ({e})."
+                if isinstance(e, ImportError):
+                    msg = "Look needs two helpers: pip install mss pillow"
+                self.start_stream()
+                self.safe_emit({"type": "error", "text": msg})
+                return
+        saved_text = "[screenshot] " + text if look else text   # images are never stored, only this marker
         now = time.time()
         chat_id = body.get("chat_id")
         if not chat_id or not rows("SELECT id FROM chats WHERE id = ?", (chat_id,)):
-            title = ("Voice: " if voice else "") + title_from(text)
+            title = ("Voice: " if voice else "Quick: " if body.get("source") == "quick"
+                     else "Look: " if look else "") + title_from(text)
             chat_id = run("INSERT INTO chats(title, created, updated) VALUES (?, ?, ?)", (title, now, now))
-        run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'user', ?, ?)", (chat_id, text, now))
+        run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'user', ?, ?)",
+            (chat_id, saved_text, now))
         history = rows("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,))[-HISTORY_TURNS:]
+        if image:
+            history[-1] = {"role": "user", "content": [
+                {"type": "text", "text": f"(This image is a screenshot of my screen right now, taken by your Look button.) {text}"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}}]}
         messages = [{"role": "system", "content": system_prompt() + (VOICE_RULES if voice else "")}] + history
         settings = get_settings()
         think = False if voice else settings["think"]
@@ -567,7 +612,8 @@ class Handler(BaseHTTPRequestHandler):
                         if BRAIN.can_start else
                         "My brain isn't running. Start llama-server, or start me without --no-brain.")})
                     return
-                for kind, val in llm_stream(messages, think=think, max_tokens=80 if voice else None):
+                for kind, val in llm_stream(messages, think=think, max_tokens=80 if voice else None,
+                                            slot=LOOK_SLOT if look else CHAT_SLOT):
                     if kind == "reasoning":
                         if not told_reasoning:
                             self.emit({"type": "reasoning"})
@@ -591,9 +637,9 @@ class Handler(BaseHTTPRequestHandler):
                     run("UPDATE chats SET updated = ? WHERE id = ?", (time.time(), chat_id))
                 except sqlite3.Error as e:
                     print(f"Couldn't save the reply: {e}")
-                if voice:
-                    broadcast({"event": "chat", "chat_id": chat_id})   # window shows the voice chat live
-                if settings["auto_memory"]:
+                if voice or look:
+                    broadcast({"event": "chat", "chat_id": chat_id})   # window shows voice / look chats live
+                if settings["auto_memory"] and not look:   # screen contents aren't facts about Erfan
                     threading.Thread(target=extract_memories, args=(text, reply), daemon=True).start()
 
     def safe_emit(self, obj):
@@ -616,16 +662,66 @@ APP_BROWSERS = [
 ]
 
 
-def open_window(url: str, force_browser: bool) -> bool:
-    """Returns True if the window blocks until it's closed (pywebview)."""
+def run_pywebview(webview, url: str, background: bool) -> None:
+    """App window + quick bar (Windows). Blocks until NUBB-E is quit."""
+    quick = CFG["app"]["quick_bar"] and sys.platform == "win32"
+    state = {"main": None, "quitting": False}
+
+    def quit_all():
+        state["quitting"] = True
+        for w in list(webview.windows):
+            w.destroy()
+
+    def open_main():
+        w = state["main"]
+        if w is not None:
+            w.show()
+            w.restore()
+            return
+        w = webview.create_window("NUBB-E", url, width=1200, height=820, background_color="#0b0f14")
+        if quick and CFG["app"]["close_to_background"]:
+            def on_closing():
+                if state["quitting"]:
+                    return True
+                w.hide()         # closing the app window keeps NUBB-E running for the quick bar
+                print(f"App window hidden. NUBB-E keeps running: {hotkey} opens the quick bar.")
+                return False
+            w.events.closing += on_closing
+        state["main"] = w
+
+    hotkey = CFG["app"]["quick_hotkey"]
+    if background and not quick:
+        print("Background mode needs the quick bar (Windows, quick_bar = true). Opening the app window.")
+    if not background or not quick:
+        open_main()
+    if not quick:
+        webview.start()
+        return
+    import nubbe_quick
+    bar = nubbe_quick.QuickBar(webview, url, open_main, quit_all)
+    nubbe_quick.on_ctrl_c(quit_all)
+
+    def started():
+        try:
+            nubbe_quick.listen_hotkey(hotkey, bar.toggle)
+            print(f"Quick bar ready: press {hotkey} from any app. Quit from its x button or Ctrl+C here.")
+        except (OSError, ValueError) as e:
+            print(e)
+    webview.start(started)
+
+
+def open_window(url: str, force_browser: bool, background: bool = False) -> bool:
+    """Returns True if the window blocks until NUBB-E is quit (pywebview)."""
     if not force_browser:
         try:
-            import webview  # optional: pip install pywebview
-            webview.create_window("NUBB-E", url, width=1200, height=820, background_color="#0b0f14")
-            webview.start()
-            return True
+            import webview  # pip install pywebview (needed for the quick bar)
         except ImportError:
-            pass
+            webview = None
+        if webview:
+            run_pywebview(webview, url, background)
+            return True
+        if background:
+            print("Background mode needs pywebview: pip install pywebview")
         for name in APP_BROWSERS:
             exe = shutil.which(name) or (name if Path(name).exists() else None)
             if exe:
@@ -642,6 +738,8 @@ def main() -> None:
     p.add_argument("--browser", action="store_true", help="open in a normal browser tab")
     p.add_argument("--port", type=int, default=PORT)
     p.add_argument("--no-window", action="store_true", help="don't open a window (just serve the page)")
+    p.add_argument("--background", action="store_true",
+                   help="start with no app window, just the quick bar hotkey")
     args = p.parse_args()
 
     init_db()
@@ -668,7 +766,7 @@ def main() -> None:
     print(f"NUBB-E is at {url}  (chats and memory saved in {DATA_DIR})")
 
     try:
-        if args.no_window or not open_window(url, args.browser):
+        if args.no_window or not open_window(url, args.browser, args.background):
             print("Press Ctrl+C here to shut NUBB-E down.")
             while True:
                 time.sleep(1)
@@ -741,6 +839,9 @@ PAGE = r"""<!doctype html>
   .send:disabled { opacity: .4; cursor: default; }
   .mode { padding: 10px 12px; border-radius: 12px; border: 1px solid var(--line); color: var(--muted);
           white-space: nowrap; }
+  .look { padding: 10px 14px; border-radius: 12px; border: 1px solid var(--glow); color: var(--glow);
+          white-space: nowrap; }
+  .look:disabled { opacity: .4; cursor: default; }
 
   /* memory panel */
   #memPanel { position: fixed; inset: 0; background: #0009; display: none; align-items: center; justify-content: center; }
@@ -776,6 +877,7 @@ PAGE = r"""<!doctype html>
   <form id="composer">
     <button type="button" class="mode" id="modeBtn" title="Smart reasons before answering; Fast skips it">Smart</button>
     <textarea id="input" rows="1" placeholder="Talk to NUBB-E...  (/remember something to save it)"></textarea>
+    <button type="button" class="look" id="lookBtn" title="NUBB-E takes a screenshot and answers your question about it">Look</button>
     <button class="send" id="sendBtn">Send</button>
   </form>
 </main>
@@ -874,22 +976,22 @@ async function openChat(id) {
 }
 function newChat() { if (busy) return; chatId = null; showEmpty(); loadChats(); setFace('happy', 1200); input.focus(); }
 
-async function send(text) {
-  if (text.startsWith('/remember ')) {
+async function send(text, look = false) {
+  if (!look && text.startsWith('/remember ')) {
     const fact = text.slice(10).trim();
     if (fact) { await api('/api/memory', { text: fact }); bubble('note', 'Saved to memory: ' + fact); setFace('wink'); }
     return;
   }
-  busy = true; sendBtn.disabled = true;
-  bubble('user', text);
-  const out = bubble('assistant', ''); out.innerHTML = '<span class="thinking">...</span>';
+  busy = true; sendBtn.disabled = true; $('lookBtn').disabled = true;
+  bubble('user', look ? '[screenshot] ' + text : text);
+  const out = bubble('assistant', ''); out.innerHTML = '<span class="thinking">' + (look ? 'looking...' : '...') + '</span>';
   setFace('thinking');
-  const userMood = reactToUser(text);
+  const userMood = look ? 'lookaround' : reactToUser(text);
   if (userMood) setFace(userMood);
   let reply = '', pending = false;
   const render = () => { pending = false; out.innerHTML = md(reply); msgs.scrollTop = msgs.scrollHeight; };
   try {
-    const res = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const res = await fetch(look ? '/api/look' : '/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                                            body: JSON.stringify({ chat_id: chatId, message: text }) });
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = '';
@@ -909,15 +1011,22 @@ async function send(text) {
         else if (ev.type === 'error') { out.innerHTML = '<span class="thinking">' + esc(ev.text) + '</span>'; }
       }
     }
-    render();
+    if (reply) render();   // keeps an error message visible when there's no reply
   } catch (e) {
     out.innerHTML = '<span class="thinking">Lost connection to NUBB-E.</span>';
   }
   setFace('idle');
   const replyMood = reactToReply(reply);
   if (replyMood) setFace(replyMood);
-  busy = false; sendBtn.disabled = false; loadChats(); input.focus();
+  busy = false; sendBtn.disabled = false; $('lookBtn').disabled = false; loadChats(); input.focus();
 }
+
+$('lookBtn').onclick = () => {   // the question box is optional: empty means "what's on my screen?"
+  if (busy) return;
+  const text = input.value.trim() || "What's on my screen?";
+  input.value = ''; input.style.height = '';
+  send(text, true);
+};
 
 $('composer').onsubmit = e => {
   e.preventDefault();

@@ -38,6 +38,11 @@ idle_unload_minutes = 10
 port = 8765
 history_turns = 40   # recent messages sent to the model
 
+# Quick bar: a small see-through bar on top of any app (Windows).
+quick_bar = true
+quick_hotkey = "alt+space"     # e.g. "ctrl+shift+space", "alt+n", "ctrl+alt+f1"
+close_to_background = true     # closing the app window keeps NUBB-E running for the quick bar
+
 [voice]
 whisper_model = "small.en"   # tiny.en / base.en / small.en
 kokoro_voice = "af_heart"

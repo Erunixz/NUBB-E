@@ -31,6 +31,9 @@ DEFAULTS = {
     "app": {
         "port": 8765,
         "history_turns": 40,
+        "quick_bar": True,
+        "quick_hotkey": "alt+space",
+        "close_to_background": True,
     },
     "voice": {
         "whisper_model": "small.en",

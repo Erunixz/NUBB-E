@@ -1,4 +1,11 @@
 # NUBB-E dependencies. Core app uses the standard library only.
 
+# Look (screen reading): screenshots + resize/JPEG
+mss
+pillow
+
+# App window + quick bar (frameless, always-on-top window; Windows uses Edge WebView2)
+pywebview
+
 # tests only
 pytest

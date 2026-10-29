@@ -393,3 +393,116 @@ def test_brain_dies_if_app_is_killed(tmp_path):
         assert wait_for(lambda: not child_up(), 10)
     finally:
         parent.kill()
+
+
+# ---------------------------------------------------------------------------
+# look (screen reading)
+# ---------------------------------------------------------------------------
+FAKE_SHOT = "ZmFrZS1qcGVn"   # base64 of "fake-jpeg": no real screen is captured in tests
+
+
+@pytest.fixture
+def eyes(monkeypatch):
+    shots = []
+
+    def fake_shot(monitor=1, width=1280):
+        shots.append((monitor, width))
+        return FAKE_SHOT
+    monkeypatch.setattr(app, "VISION", True)
+    monkeypatch.setattr(app, "take_screenshot", fake_shot)
+    return shots
+
+
+def test_look_sends_image_and_saves_only_text(base, fake, eyes):
+    req = urllib.request.Request(base + "/api/look", data=json.dumps({"message": "What app is this?"}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        events = [json.loads(l.decode()[5:]) for l in resp if l.startswith(b"data:")]
+    assert reply_of(events) == REPLY and events[-1]["type"] == "done"
+    assert eyes == [(1, 1280)]
+    sent = chat_requests(fake)[-1]
+    content = sent["messages"][-1]["content"]
+    assert content[0]["type"] == "text" and content[0]["text"].endswith("What app is this?")
+    assert "screenshot of my screen" in content[0]["text"]
+    assert content[1]["image_url"]["url"] == "data:image/jpeg;base64," + FAKE_SHOT
+    assert sent["id_slot"] == app.LOOK_SLOT
+    cid = events[0]["chat_id"]
+    saved = get(base, f"/api/chats/{cid}")
+    assert saved[0]["content"] == "[screenshot] What app is this?"     # no image in the DB
+    assert FAKE_SHOT not in json.dumps(saved)
+    assert get(base, "/api/chats")[0]["title"].startswith("Look: ")
+    time.sleep(0.3)
+    assert extract_requests(fake) == []                                 # screen contents aren't memories
+
+
+def look(base, body):
+    req = urllib.request.Request(base + "/api/look", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return [json.loads(l.decode()[5:]) for l in resp if l.startswith(b"data:")]
+
+
+def test_look_default_question_and_follow_up(base, fake, eyes):
+    cid = look(base, {})[0]["chat_id"]
+    assert chat_requests(fake)[-1]["messages"][-1]["content"][0]["text"].endswith("What's on my screen?")
+    chat(base, "And what should I click?", chat_id=cid)
+    msgs = chat_requests(fake)[-1]["messages"]
+    # the follow-up keeps the look as text only; the image is sent just once
+    assert msgs[1]["content"] == "[screenshot] What's on my screen?"
+    assert "image_url" not in json.dumps(msgs)
+
+
+def test_look_with_vision_off(base, fake, monkeypatch):
+    monkeypatch.setattr(app, "VISION", False)
+    events = look(base, {"message": "hi"})
+    assert events[-1]["type"] == "error" and "mmproj" in events[-1]["text"]
+    assert get(base, "/api/chats") == []
+
+
+def test_look_bad_monitor(base, fake, monkeypatch):
+    monkeypatch.setattr(app, "VISION", True)
+    def no_monitor(monitor=1, width=1280):
+        raise ValueError("Monitor 5 not found (you have 1).")
+    monkeypatch.setattr(app, "take_screenshot", no_monitor)
+    events = look(base, {"monitor": 5})
+    assert events == [{"type": "error", "text": "Monitor 5 not found (you have 1)."}]
+
+
+def test_real_screenshot_helper():
+    """The real capture code (mss + Pillow): primary monitor, at most 1280 px wide, valid JPEG."""
+    import base64
+    look_mod = pytest.importorskip("look")
+    pytest.importorskip("mss")
+    img = look_mod.screenshot(1, 1280)
+    assert 0 < img.width <= 1280
+    data = base64.b64decode(look_mod.to_b64(img))
+    assert data[:2] == b"\xff\xd8"                                       # JPEG header
+
+
+# ---------------------------------------------------------------------------
+# quick bar
+# ---------------------------------------------------------------------------
+def test_parse_hotkey():
+    import nubbe_quick as q
+    assert q.parse_hotkey("alt+space") == (0x1, 0x20)
+    assert q.parse_hotkey("Ctrl + Shift + N") == (0x2 | 0x4, ord("N"))
+    assert q.parse_hotkey("ctrl+alt+f1") == (0x2 | 0x1, 0x70)
+    for bad in ("alt+", "alt+banana", "ctrl+shift"):
+        with pytest.raises(ValueError):
+            q.parse_hotkey(bad)
+
+
+def test_quick_page_served(base):
+    html = urllib.request.urlopen(base + "/quick", timeout=5).read().decode()
+    assert "<title>NUBB-E Quick</title>" in html and "/face.js" in html
+    assert "http" not in html.replace("http://", "")      # no online links: works offline
+
+
+def test_quick_chats_are_saved_with_title(base, fake, eyes):
+    events = chat(base, "Summarize this", source="quick")
+    assert reply_of(events) == REPLY
+    assert get(base, "/api/chats")[0]["title"] == "Quick: Summarize this"
+    cid = look(base, {"message": "What is this page?", "source": "quick", "chat_id": events[0]["chat_id"]})[0]["chat_id"]
+    assert cid == events[0]["chat_id"]                     # same quick chat for the session
+    assert [m["content"] for m in get(base, f"/api/chats/{cid}") if m["role"] == "user"] == \
+        ["Summarize this", "[screenshot] What is this page?"]
