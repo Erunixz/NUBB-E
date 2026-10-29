@@ -21,7 +21,13 @@ except ImportError:
     def set_face(*args, **kwargs):
         pass
 
-URL = "http://localhost:8080/v1/chat/completions"
+try:
+    from nubbe_config import CFG
+    LLM_PORT = CFG["brain"]["port"]
+except ImportError:
+    LLM_PORT = 8080
+
+URL = f"http://localhost:{LLM_PORT}/v1/chat/completions"
 DIM, RESET = "\033[2m", "\033[0m"
 
 

@@ -37,6 +37,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # Kokoro runs on the CPU by default so it never fights the brain for the 8 GB GPU.
 # Pass --tts-gpu to let it use the GPU instead.
@@ -53,8 +54,17 @@ except ImportError:
     def set_face(*args, **kwargs):
         pass
 
-APP_URL = "http://127.0.0.1:8765/api/chat"            # NUBB-E app (saves chats + memory)
-LLM_URL = "http://localhost:8080/v1/chat/completions"  # fallback: brain directly
+try:
+    from nubbe_config import CFG, path
+    APP_PORT, LLM_PORT, VOICE = CFG["app"]["port"], CFG["brain"]["port"], CFG["voice"]
+except ImportError:
+    APP_PORT, LLM_PORT = 8765, 8080
+    VOICE = {"whisper_model": "small.en", "kokoro_voice": "af_heart", "kokoro_speed": 1.05,
+             "piper_voice": "", "mic_threshold": 0.015}
+    path = Path
+
+APP_URL = f"http://127.0.0.1:{APP_PORT}/api/chat"            # NUBB-E app (saves chats + memory)
+LLM_URL = f"http://localhost:{LLM_PORT}/v1/chat/completions"  # fallback: brain directly
 GENERATING = threading.Event()   # LLM is still writing the reply
 SPEAKING = threading.Event()     # a sentence is playing right now
 MIC_RATE = 16000          # whisper expects 16 kHz mono
@@ -248,14 +258,16 @@ def stream_reply(heard: str, st: dict, speak_q: "queue.Queue[str | None]") -> st
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--voice", default="af_heart",
+    p.add_argument("--voice", default=VOICE["kokoro_voice"],
                    help="Kokoro voice name (af_heart, af_bella, am_michael, ...) or a Piper .onnx file")
-    p.add_argument("--speed", type=float, default=1.05, help="Kokoro speaking speed")
-    p.add_argument("--piper-voice", help="Piper .onnx voice to fall back to if Kokoro can't load")
+    p.add_argument("--speed", type=float, default=VOICE["kokoro_speed"], help="Kokoro speaking speed")
+    p.add_argument("--piper-voice", default=str(path(VOICE["piper_voice"])) if VOICE["piper_voice"] else None,
+                   help="Piper .onnx voice to fall back to if Kokoro can't load")
     p.add_argument("--tts-gpu", action="store_true", help="let Kokoro use the GPU (default: CPU)")
     p.add_argument("--prompt", default="nubbe_system_prompt.txt", help="personality file")
-    p.add_argument("--whisper", default="small.en", help="tiny.en / base.en / small.en")
-    p.add_argument("--threshold", type=float, default=0.015, help="mic loudness to count as talking")
+    p.add_argument("--whisper", default=VOICE["whisper_model"], help="tiny.en / base.en / small.en")
+    p.add_argument("--threshold", type=float, default=VOICE["mic_threshold"],
+                   help="mic loudness to count as talking")
     args = p.parse_args()
 
     with open(args.prompt, encoding="utf-8") as f:

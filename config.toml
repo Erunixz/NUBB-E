@@ -1,0 +1,39 @@
+# NUBB-E settings. Change things here, not in the Python files.
+# Paths are relative to this folder (or use a full path).
+# If a setting is missing, NUBB-E uses its built-in default.
+
+[brain]
+llama_server = "bin/llama.cpp/llama-server.exe"
+model = "models/Qwen3.6-35B-A3B-MTP-UD-IQ4_XS.gguf"
+mmproj = "models/mmproj-Qwen3.6-35B-A3B-F16.gguf"   # vision. Set to "" to turn it off
+
+# Tuned in Phase 1 on the RTX 4060 (8 GB) + Ryzen 7 7745HX:
+# about 20 to 23 tok/s with vision loaded and 0.6 GB VRAM to spare.
+# Lower n_cpu_moe = more on the GPU. 30 or lower overflows VRAM with vision on.
+n_cpu_moe = 31
+threads = 16
+context = 32768
+extra_flags = ["-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"]
+port = 8080
+
+# Stop the brain after this many minutes with no chat, to free RAM and VRAM
+# and let the laptop cool down. It wakes up again on your next message.
+idle_unload_minutes = 10
+
+# Fast backup model (about 33 tok/s, fits fully on the GPU, no vision).
+# To use it, swap in these lines:
+#   model = "models/Qwen3.5-9B-Q4_K_M.gguf"
+#   mmproj = ""
+#   n_cpu_moe = 0
+#   extra_flags = ["-ngl", "99", "-ub", "256", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"]
+
+[app]
+port = 8765
+history_turns = 40   # recent messages sent to the model
+
+[voice]
+whisper_model = "small.en"   # tiny.en / base.en / small.en
+kokoro_voice = "af_heart"
+kokoro_speed = 1.05
+piper_voice = ""             # optional fallback, e.g. "voices/en_US-amy-medium.onnx"
+mic_threshold = 0.015        # mic loudness that counts as talking (tuned in Phase 5)

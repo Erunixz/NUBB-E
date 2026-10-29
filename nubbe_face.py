@@ -37,7 +37,11 @@ import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 8765
+try:
+    from nubbe_config import CFG
+    PORT = CFG["app"]["port"]
+except ImportError:
+    PORT = 8765
 BASE_STATES = {"idle", "listening", "thinking", "talking", "happy", "sleep"}
 REACTIONS = {"surprised", "curious", "excited", "sad", "confused", "wink", "giggle", "lookaround"}
 STATES = BASE_STATES | REACTIONS

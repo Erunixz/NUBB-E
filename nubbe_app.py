@@ -39,19 +39,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Edit these to match your setup (paths to llama-server and your model files)
+# Settings come from config.toml (paths to llama-server, models, ports)
 # ---------------------------------------------------------------------------
-LLAMA_SERVER = "llama-server"   # or a full path, e.g. r"C:\ai\llama.cpp\build\bin\Release\llama-server.exe"
-LLAMA_ARGS = [
-    "-m", "models/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf",
-    "--mmproj", "models/mmproj.gguf",
-    "-ngl", "99", "--n-cpu-moe", "28",
-    "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0",
-    "-c", "32768", "--jinja", "--port", "8080",
-]
-LLM_URL = "http://127.0.0.1:8080"
-PORT = 8765                      # same port as nubbe_face.py, so the voice script drives this face too
-HISTORY_TURNS = 40               # how many recent messages are sent to the model
+from nubbe_config import CFG, llama_args, path   # keep nubbe_config.py next to this file
+
+LLAMA_SERVER = str(path(CFG["brain"]["llama_server"]))
+LLAMA_ARGS = llama_args(CFG["brain"])
+LLM_URL = f"http://127.0.0.1:{CFG['brain']['port']}"
+PORT = CFG["app"]["port"]        # same port as nubbe_face.py, so the voice script drives this face too
+HISTORY_TURNS = CFG["app"]["history_turns"]   # how many recent messages are sent to the model
 
 HERE = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".nubbe"
@@ -140,10 +136,10 @@ def start_llm():
     if llm_alive():
         print("Brain already running.")
         return None
-    exe = shutil.which(LLAMA_SERVER) or (LLAMA_SERVER if Path(LLAMA_SERVER).exists() else None)
+    exe = LLAMA_SERVER if Path(LLAMA_SERVER).exists() else shutil.which(CFG["brain"]["llama_server"])
     if not exe:
-        print(f"Couldn't find llama-server ('{LLAMA_SERVER}'). Set LLAMA_SERVER at the top of "
-              "nubbe_app.py, or start it yourself and use --no-brain.")
+        print(f"Couldn't find llama-server ('{LLAMA_SERVER}'). Set llama_server in "
+              "config.toml, or start it yourself and use --no-brain.")
         return None
     log = open(DATA_DIR / "llama-server.log", "w")
     print("Starting the brain (first load can take a minute)...")

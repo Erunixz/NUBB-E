@@ -21,7 +21,13 @@ import urllib.request
 import mss
 from PIL import Image
 
-DEFAULT_URL = "http://localhost:8080/v1/chat/completions"
+try:
+    from nubbe_config import CFG
+    LLM_PORT = CFG["brain"]["port"]
+except ImportError:
+    LLM_PORT = 8080
+
+DEFAULT_URL = f"http://localhost:{LLM_PORT}/v1/chat/completions"
 
 
 def grab(monitor_idx: int, max_width: int, save: bool) -> str:
