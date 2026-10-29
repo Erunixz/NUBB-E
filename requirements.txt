@@ -7,5 +7,13 @@ pillow
 # App window + quick bar (frameless, always-on-top window; Windows uses Edge WebView2)
 pywebview
 
+# Voice (nubbe_voice.py and the app's mic button). Also needs espeak-ng (system program).
+faster-whisper
+sounddevice
+numpy
+kokoro>=0.9.4
+soundfile
+piper-tts          # optional backup voice
+
 # tests only
 pytest

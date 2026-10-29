@@ -36,7 +36,7 @@ DEFAULTS = {
         "close_to_background": True,
     },
     "voice": {
-        "whisper_model": "small.en",
+        "whisper_model": "base.en",
         "kokoro_voice": "af_heart",
         "kokoro_speed": 1.05,
         "piper_voice": "",

@@ -15,8 +15,9 @@ threads = 16
 context = 32768
 # --no-cache-idle-slots keeps the chat's cache in place while memory learning runs,
 # so each new message only reads the new part instead of the whole chat again.
+# --parallel 4: one brain slot each for chat, memory learning, Look and voice.
 extra_flags = ["-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja",
-               "--no-cache-idle-slots"]
+               "--no-cache-idle-slots", "--parallel", "4"]
 port = 8080
 
 # Max "thinking" tokens in Smart mode before it must answer (-1 = no limit).
@@ -44,8 +45,8 @@ quick_hotkey = "alt+space"     # e.g. "ctrl+shift+space", "alt+n", "ctrl+alt+f1"
 close_to_background = true     # closing the app window keeps NUBB-E running for the quick bar
 
 [voice]
-whisper_model = "small.en"   # tiny.en / base.en / small.en
-kokoro_voice = "af_heart"
+whisper_model = "base.en"    # tiny.en / base.en / small.en (base.en: 0.6 s per question on this CPU, small.en: 1.9 s)
+kokoro_voice = "am_michael"          # picked by Erfan in Phase 5
 kokoro_speed = 1.05
-piper_voice = ""             # optional fallback, e.g. "voices/en_US-amy-medium.onnx"
+piper_voice = "voices/en_US-amy-medium.onnx"   # backup voice if Kokoro cannot load
 mic_threshold = 0.015        # mic loudness that counts as talking (tuned in Phase 5)

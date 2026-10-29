@@ -2,8 +2,8 @@
 """NUBB-E app: one launcher for everything, fully offline.
 
     python nubbe_app.py
+cdcdef
 
-What it does:
   - starts the brain (llama-server) if it isn't running yet
   - opens a NUBB-E window: animated face on top, chat below
   - saves every chat (sidebar, like any chat app)
@@ -39,6 +39,7 @@ chat, never the image itself.
 import argparse
 import atexit
 import json
+import os
 import queue
 import re
 import shutil
@@ -104,7 +105,7 @@ CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, text TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
 DEFAULT_SETTINGS = {"auto_memory": "1", "think": "0"}   # Fast by default: Smart thinks first, which is slow
-CHAT_SLOT, MEMORY_SLOT, LOOK_SLOT = 0, 1, 2   # fixed brain slots, so each keeps its prompt cached
+CHAT_SLOT, MEMORY_SLOT, LOOK_SLOT, VOICE_SLOT = 0, 1, 2, 3   # fixed brain slots, so each keeps its prompt cached
 VISION = bool(CFG["brain"].get("mmproj"))
 
 
@@ -246,13 +247,7 @@ class Brain:
             if proc.poll() is not None:
                 return
             time.sleep(0.5)
-        try:
-            with self.use():
-                msgs = [{"role": "system", "content": system_prompt()}, {"role": "user", "content": "hi"}]
-                for _ in llm_stream(msgs, think=False, max_tokens=1):
-                    pass
-        except Exception:
-            pass
+        warm_slot(system_prompt(), CHAT_SLOT)
 
     def ensure(self, on_wait=None, timeout=600) -> bool:
         """Makes sure the brain is up, waking it if needed. Calls on_wait() once if we have to wait."""
@@ -322,6 +317,73 @@ class Brain:
 
 
 BRAIN = Brain(idle_minutes=CFG["brain"]["idle_unload_minutes"])
+
+
+def warm_slot(system: str, slot: int) -> None:
+    """Sends a tiny hidden message so this slot has the system prompt cached (and the GPU is warm)."""
+    try:
+        with BRAIN.use():
+            msgs = [{"role": "system", "content": system}, {"role": "user", "content": "hi"}]
+            for _ in llm_stream(msgs, think=False, max_tokens=1, slot=slot):
+                pass
+    except Exception:
+        pass
+
+
+class Voice:
+    """The mic button: runs nubbe_voice.py --serve in the background (speech models load once,
+    on the CPU) and sends it one command per line: listen / stop / quit."""
+
+    def __init__(self):
+        self.proc = None
+        self.job = None
+        self.log = None
+        self.lock = threading.Lock()
+
+    def send(self, cmd: str) -> str:
+        with self.lock:
+            if self.proc is None or self.proc.poll() is not None:
+                if cmd != "listen":
+                    return "off"
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                if self.log:
+                    self.log.close()
+                self.log = open(DATA_DIR / "voice.log", "w", encoding="utf-8")
+                self.proc = subprocess.Popen(
+                    [sys.executable, str(HERE / "nubbe_voice.py"), "--serve"], cwd=HERE,
+                    stdin=subprocess.PIPE, stdout=self.log, stderr=subprocess.STDOUT, text=True,
+                    env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1"))
+                self.job = tie_to_app(self.proc)
+                broadcast({"state": "thinking", "status": "loading voice..."})
+                status = "starting"
+                if llm_alive():   # get the brain's voice slot ready while the speech models load
+                    threading.Thread(target=warm_slot, args=(system_prompt() + VOICE_RULES, VOICE_SLOT),
+                                     daemon=True).start()
+            else:
+                status = "ok"
+            try:
+                self.proc.stdin.write(cmd + "\n")
+                self.proc.stdin.flush()
+            except OSError:
+                return "off"
+            return status
+
+    def stop(self) -> None:
+        with self.lock:
+            p, self.proc = self.proc, None
+            if p and p.poll() is None:
+                try:
+                    p.stdin.write("quit\n")
+                    p.stdin.flush()
+                    p.wait(3)
+                except (OSError, subprocess.TimeoutExpired):
+                    p.kill()
+            if self.log:
+                self.log.close()
+                self.log = None
+
+
+VOICE = Voice()
 
 
 def system_prompt() -> str:
@@ -507,6 +569,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/chat":
             self.chat(body)
+        elif path == "/api/voice":   # the mic button
+            action = body.get("action")
+            if action not in ("listen", "stop"):
+                self.send_error(400)
+                return
+            self.send_json({"voice": VOICE.send(action)})
         elif path == "/api/look":
             self.chat(body, look=True)
         elif path == "/state":  # set_face() from other scripts
@@ -613,7 +681,7 @@ class Handler(BaseHTTPRequestHandler):
                         "My brain isn't running. Start llama-server, or start me without --no-brain.")})
                     return
                 for kind, val in llm_stream(messages, think=think, max_tokens=80 if voice else None,
-                                            slot=LOOK_SLOT if look else CHAT_SLOT):
+                                            slot=LOOK_SLOT if look else VOICE_SLOT if voice else CHAT_SLOT):
                     if kind == "reasoning":
                         if not told_reasoning:
                             self.emit({"type": "reasoning"})
@@ -751,6 +819,7 @@ def main() -> None:
 
     BRAIN.can_start = not args.no_brain
     atexit.register(BRAIN.stop)   # always stop the brain we started, however we exit
+    atexit.register(VOICE.stop)
     for sig in ("SIGTERM", "SIGBREAK", "SIGHUP"):
         if hasattr(signal, sig):
             signal.signal(getattr(signal, sig), lambda *_: sys.exit(0))
@@ -774,8 +843,9 @@ def main() -> None:
         pass
     finally:
         server.shutdown()
+        VOICE.stop()
         BRAIN.stop()
-        print("bye! *happy beep*")
+        print("bye!")
 
 
 PAGE = r"""<!doctype html>
@@ -842,6 +912,9 @@ PAGE = r"""<!doctype html>
   .look { padding: 10px 14px; border-radius: 12px; border: 1px solid var(--glow); color: var(--glow);
           white-space: nowrap; }
   .look:disabled { opacity: .4; cursor: default; }
+  .mic { padding: 10px 13px; border-radius: 12px; border: 1px solid var(--line); color: var(--muted); }
+  .mic.listening { border-color: #ff6b8b; color: #ff6b8b; box-shadow: 0 0 12px #ff6b8b55; }
+  .mic.busy { border-color: var(--glow); color: var(--glow); }
 
   /* memory panel */
   #memPanel { position: fixed; inset: 0; background: #0009; display: none; align-items: center; justify-content: center; }
@@ -877,6 +950,7 @@ PAGE = r"""<!doctype html>
   <form id="composer">
     <button type="button" class="mode" id="modeBtn" title="Smart reasons before answering; Fast skips it">Smart</button>
     <textarea id="input" rows="1" placeholder="Talk to NUBB-E...  (/remember something to save it)"></textarea>
+    <button type="button" class="mic" id="micBtn" title="Talk to NUBB-E (press, talk, it answers out loud). Press again to stop.">&#127908;</button>
     <button type="button" class="look" id="lookBtn" title="NUBB-E takes a screenshot and answers your question about it">Look</button>
     <button class="send" id="sendBtn">Send</button>
   </form>
@@ -1021,6 +1095,20 @@ async function send(text, look = false) {
   busy = false; sendBtn.disabled = false; $('lookBtn').disabled = false; loadChats(); input.focus();
 }
 
+// mic button: the voice helper reports listening / thinking / talking / idle through the face events
+function showMic(state, status) {
+  const b = $('micBtn');
+  b.classList.toggle('listening', state === 'listening');
+  b.classList.toggle('busy', state === 'thinking' || state === 'talking');
+  b.title = state === 'listening' ? 'Listening... press to stop and answer now'
+          : (state === 'talking' || state === 'thinking') ? (status === 'loading voice...' ? 'Loading voice (first time takes a bit)' : 'Press to stop')
+          : 'Talk to NUBB-E (press, talk, it answers out loud). Press again to stop.';
+}
+$('micBtn').onclick = async () => {
+  const r = await api('/api/voice', { action: 'listen' });
+  if (r.voice === 'starting') { setFace('thinking'); faceStatus.textContent = 'loading voice...'; showMic('thinking', 'loading voice...'); }
+};
+
 $('lookBtn').onclick = () => {   // the question box is optional: empty means "what's on my screen?"
   if (busy) return;
   const text = input.value.trim() || "What's on my screen?";
@@ -1086,6 +1174,7 @@ es.onmessage = e => {
   if (d.event === 'memory' && $('memPanel').classList.contains('open')) loadMemory();
   if (d.event === 'chat' && !busy) { if (chatId === d.chat_id) openChat(d.chat_id); else loadChats(); }
   if (d.state && !busy) { setFace(d.state); if (d.status) faceStatus.textContent = d.status; }
+  if (d.state) showMic(d.state, d.status);
 };
 
 (async () => {

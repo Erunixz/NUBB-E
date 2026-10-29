@@ -87,20 +87,29 @@ def on_ctrl_c(callback) -> None:
     ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)
 
 
-KEY_COLOR = "#010203"   # page background that Windows turns fully see-through
+BAR_COLOR = "#0b1016"
+RADIUS = 18
 
 
 def see_through(hwnd: int, opacity: float = 0.94) -> bool:
-    """Windows: makes the window a bit see-through, and the KEY_COLOR areas around the
-    rounded bar fully invisible (clicks go through them too)."""
+    """Windows: makes the whole bar a bit see-through. Plain opacity only: a color key would
+    also make the web content click-through, so the bar couldn't be clicked again."""
     if not (IS_WINDOWS and hwnd):
         return False
     u32 = ctypes.windll.user32
     style = u32.GetWindowLongW(hwnd, -20)                         # GWL_EXSTYLE
     u32.SetWindowLongW(hwnd, -20, style | 0x80000)                # WS_EX_LAYERED
-    r, g, b = (int(KEY_COLOR[i:i + 2], 16) for i in (1, 3, 5))
-    return bool(u32.SetLayeredWindowAttributes(hwnd, r | (g << 8) | (b << 16), int(255 * opacity),
-                                               0x1 | 0x2))         # LWA_COLORKEY | LWA_ALPHA
+    return bool(u32.SetLayeredWindowAttributes(hwnd, 0, int(255 * opacity), 0x2))   # LWA_ALPHA
+
+
+def round_corners(hwnd: int, width: int, height: int) -> None:
+    """Windows: cuts the window to a rounded rectangle (sizes in page pixels)."""
+    if not (IS_WINDOWS and hwnd):
+        return
+    u32, gdi = ctypes.windll.user32, ctypes.windll.gdi32
+    scale = (u32.GetDpiForWindow(hwnd) or 96) / 96
+    w, h, r = round(width * scale), round(height * scale), round(RADIUS * 2 * scale)
+    u32.SetWindowRgn(hwnd, gdi.CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r), True)   # Windows owns the region now
 
 
 def foreground() -> int:
@@ -112,11 +121,49 @@ def find_window(title: str) -> int:
 
 
 def focus(hwnd: int) -> None:
-    if hwnd:
-        u32 = ctypes.windll.user32
-        if u32.IsIconic(hwnd):
-            u32.ShowWindow(hwnd, 9)   # SW_RESTORE
+    """Brings hwnd to the front with keyboard focus. Windows only lets the app that has the
+    keyboard do that, so we briefly share input with it (AttachThreadInput)."""
+    if not (IS_WINDOWS and hwnd):
+        return
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    if u32.IsIconic(hwnd):
+        u32.ShowWindow(hwnd, 9)       # SW_RESTORE
+    fg = u32.GetForegroundWindow()
+    if fg == hwnd:
+        return
+    theirs = u32.GetWindowThreadProcessId(fg, None) if fg else 0
+    mine = k32.GetCurrentThreadId()
+    attached = bool(theirs and theirs != mine and u32.AttachThreadInput(mine, theirs, True))
+    try:
+        u32.BringWindowToTop(hwnd)
         u32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            u32.AttachThreadInput(mine, theirs, False)
+    focus_page(hwnd)
+
+
+def focus_page(hwnd: int) -> None:
+    """The web page lives in a child window (Edge WebView2). Windows focuses the outer window
+    but not always the page, so keys would go nowhere until a click. Hand focus to the page."""
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(child, _):
+        name = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(child, name, 64)
+        if name.value == "Chrome_RenderWidgetHostHWND":
+            found.append(child)
+            return False
+        return True
+    u32.EnumChildWindows(hwnd, each, 0)
+    if not found:
+        return
+    theirs, mine = u32.GetWindowThreadProcessId(found[0], None), k32.GetCurrentThreadId()
+    if theirs and theirs != mine and u32.AttachThreadInput(mine, theirs, True):
+        u32.SetFocus(found[0])
+        u32.AttachThreadInput(mine, theirs, False)
 
 
 def _clipboard_text():
@@ -199,29 +246,51 @@ class QuickBar:
         self._window = webview.create_window(
             TITLE, url + "/quick", js_api=self, width=WIDTH, height=COLLAPSED, x=x, y=y,
             frameless=True, easy_drag=False, on_top=True, hidden=True,
-            resizable=False, background_color=KEY_COLOR, focus=True)
+            resizable=False, background_color=BAR_COLOR, focus=True)
 
     def toggle(self) -> None:
-        if self._visible:
+        bar = find_window(TITLE)
+        if self._visible and foreground() == bar:
             self.hide()
+            return
+        if self._visible:              # open but behind your focus: bring it back instead of hiding
+            self.activate()
             return
         hwnd = foreground()
         if hwnd and hwnd != find_window(TITLE):
             self._prev = hwnd
         if not self._styled:
             self._styled = see_through(find_window(TITLE))
+            round_corners(find_window(TITLE), WIDTH, COLLAPSED)
         self._window.show()
         self._visible = True
-        focus(find_window(TITLE))
+        bar = find_window(TITLE)
+        u32 = ctypes.windll.user32
+        for _ in range(30):                # show() happens a moment later on the window's own thread
+            if u32.IsWindowVisible(bar):
+                break
+            time.sleep(0.01)
+        for _ in range(3):                 # Windows sometimes ignores the first try
+            focus(bar)
+            if foreground() == bar:
+                break
+            time.sleep(0.05)
         self._window.run_js("window.quickOpened && quickOpened()")   # run_js doesn't wait, so the hotkey stays snappy
 
     # --- called from the bar's page ---
+    def activate(self) -> None:
+        """Gives the bar keyboard focus again (after Erfan clicked into another app and back)."""
+        focus(find_window(TITLE))
+        self._window.run_js("window.quickOpened && quickOpened(false)")
+
     def hide(self) -> None:
         self._window.hide()
         self._visible = False
 
     def set_height(self, height) -> None:
-        self._window.resize(WIDTH, max(COLLAPSED, min(EXPANDED, int(height))))
+        height = max(COLLAPSED, min(EXPANDED, int(height)))
+        self._window.resize(WIDTH, height)
+        round_corners(find_window(TITLE), WIDTH, height)
 
     def insert(self, text: str) -> bool:
         """Pastes text into the window Erfan was in before opening the bar."""
@@ -246,10 +315,11 @@ QUICK_PAGE = r"""<!doctype html>
 <style>
   :root { --glow: #6ff3ff; --text: #d9faff; --muted: #7fa4ad; --line: #1f3a44; }
   * { box-sizing: border-box; }
-  html, body { margin: 0; background: #010203; font: 15px/1.45 system-ui, "Segoe UI", sans-serif; color: var(--text); overflow: hidden; }
-  .bar { margin: 2px; background: #0b1016; border: 1px solid #2a5866; border-radius: 18px; overflow: hidden; }
+  html, body { margin: 0; background: #0b1016; font: 15px/1.45 system-ui, "Segoe UI", sans-serif; color: var(--text); overflow: hidden; }
+  .bar { background: #0b1016; border: 1px solid #2a5866; border-radius: 18px; overflow: hidden; }
   .row { display: flex; gap: 10px; align-items: center; padding: 10px 12px; }
-  .face { width: 46px; height: 40px; flex: none; }
+  .face { width: 46px; height: 40px; flex: none; cursor: move; }
+  .face canvas { pointer-events: none; }
   .face canvas { width: 100%; height: 100%; display: block; }
   textarea { flex: 1; resize: none; overflow: hidden; height: 40px; max-height: 120px; padding: 9px 12px; border-radius: 12px; border: 1px solid var(--line);
              background: #ffffff08; color: var(--text); font: inherit; outline: none; }
@@ -274,7 +344,7 @@ QUICK_PAGE = r"""<!doctype html>
 <body>
 <div class="bar" id="bar">
   <div class="row">
-    <div class="face" id="faceBox"><canvas id="c"></canvas></div>
+    <div class="face pywebview-drag-region" id="faceBox" title="Drag to move"><canvas id="c"></canvas></div>
     <textarea id="input" rows="1" placeholder="Ask NUBB-E...  (Enter: send, Ctrl+Enter: Look, Esc: hide)"></textarea>
     <button class="look" id="lookBtn" title="Read the screen behind this bar">Look</button>
     <button class="icon" id="appBtn" title="Open the NUBB-E app">&#9634;</button>
@@ -309,7 +379,7 @@ function plain(src) {   // what Insert pastes: no markdown symbols
   return src.replace(/```[^\n]*\n?/g, '').replace(/\*\*([^*\n]+)\*\*/g, '$1').replace(/__([^_\n]+)__/g, '$1')
             .replace(/`([^`\n]+)`/g, '$1').replace(/^#+\s*/gm, '').trim();
 }
-function fit() { requestAnimationFrame(() => api() && api().set_height($('bar').offsetHeight + 12)); }
+function fit() { requestAnimationFrame(() => api() && api().set_height($('bar').offsetHeight)); }
 function status(text) { out.classList.add('show'); answer.innerHTML = '<span class="status">' + esc(text) + '</span>'; fit(); }
 
 async function ask(text, look) {
@@ -369,7 +439,11 @@ $('insertBtn').onclick = async () => {
 };
 $('copyBtn').onclick = async () => { try { await navigator.clipboard.writeText(plain(reply)); $('hint').textContent = 'Copied!'; } catch (e) {} };
 $('newBtn').onclick = () => { chatId = null; reply = ''; out.classList.remove('show'); actions.classList.remove('show'); answer.innerHTML = ''; input.focus(); fit(); };
-window.quickOpened = () => { input.focus(); input.select(); face('curious'); fit(); };
+window.quickOpened = (fresh = true) => { input.focus(); if (fresh) { input.select(); face('curious'); } fit(); };
+// clicking the bar after using another app: take keyboard focus back (Windows won't do it on its own here)
+document.addEventListener('mousedown', e => {
+  if (!document.hasFocus() && api() && !e.target.closest('.pywebview-drag-region')) api().activate();
+}, true);
 window.addEventListener('pywebviewready', fit);
 </script>
 </body>

@@ -506,3 +506,29 @@ def test_quick_chats_are_saved_with_title(base, fake, eyes):
     assert cid == events[0]["chat_id"]                     # same quick chat for the session
     assert [m["content"] for m in get(base, f"/api/chats/{cid}") if m["role"] == "user"] == \
         ["Summarize this", "[screenshot] What is this page?"]
+
+
+# ---------------------------------------------------------------------------
+# voice (mic button)
+# ---------------------------------------------------------------------------
+def test_mic_button_endpoint(base, fake, monkeypatch):
+    with pytest.raises(urllib.error.HTTPError) as e:
+        post(base, "/api/voice", {"action": "dance"})
+    assert e.value.code == 400
+    sent = []
+    monkeypatch.setattr(app, "VOICE", type("V", (), {"send": lambda self, a: sent.append(a) or "ok"})())
+    assert post(base, "/api/voice", {"action": "listen"}) == {"voice": "ok"}
+    assert post(base, "/api/voice", {"action": "stop"}) == {"voice": "ok"}
+    assert sent == ["listen", "stop"]
+
+
+def test_voice_stop_when_not_running_does_nothing():
+    v = app.Voice()
+    assert v.send("stop") == "off" and v.proc is None    # "stop" never starts the voice helper
+
+
+def test_voice_chats_use_their_own_brain_slot(base, fake):
+    chat(base, "Quick question", voice=True)
+    assert chat_requests(fake)[-1]["id_slot"] == app.VOICE_SLOT
+    chat(base, "Normal question")
+    assert chat_requests(fake)[-1]["id_slot"] == app.CHAT_SLOT
