@@ -64,7 +64,9 @@ VOICE_RULES = (
     "\n\n## Voice mode\n"
     "You are speaking out loud right now. Reply in ONE short sentence, like a quick spoken reply. "
     "Only go longer if Erfan explicitly asks for detail. "
-    "No markdown, no lists, no code blocks, no emoji: everything you write is read aloud."
+    "No markdown, no lists, no code blocks, no emoji: everything you write is read aloud. "
+    "Out loud you may add a little robot sound now and then, like *happy beep* or *nerd beep*, "
+    "but sparingly, never in every reply."
 )
 
 EXTRACT_PROMPT = (
@@ -88,7 +90,8 @@ CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY,
 CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, text TEXT NOT NULL, source TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
-DEFAULT_SETTINGS = {"auto_memory": "1", "think": "1"}
+DEFAULT_SETTINGS = {"auto_memory": "1", "think": "0"}   # Fast by default: Smart thinks first, which is slow
+CHAT_SLOT, MEMORY_SLOT = 0, 1   # fixed brain slots, so each keeps its prompt cached
 
 
 def connect() -> sqlite3.Connection:
@@ -212,7 +215,23 @@ class Brain:
         self.job = tie_to_app(self.proc)
         self.asleep = False
         self.last_used = time.time()
+        threading.Thread(target=self.warm_up, args=(self.proc,), daemon=True).start()
         return True
+
+    def warm_up(self, proc) -> None:
+        """Once loaded, send a tiny hidden message with the system prompt, so the GPU is warmed
+        up and the prompt is cached before Erfan's first real message."""
+        while not llm_alive():
+            if proc.poll() is not None:
+                return
+            time.sleep(0.5)
+        try:
+            with self.use():
+                msgs = [{"role": "system", "content": system_prompt()}, {"role": "user", "content": "hi"}]
+                for _ in llm_stream(msgs, think=False, max_tokens=1):
+                    pass
+        except Exception:
+            pass
 
     def ensure(self, on_wait=None, timeout=600) -> bool:
         """Makes sure the brain is up, waking it if needed. Calls on_wait() once if we have to wait."""
@@ -297,9 +316,9 @@ def system_prompt() -> str:
     return base
 
 
-def llm_stream(messages: list, think: bool, max_tokens=None, temperature=None):
+def llm_stream(messages: list, think: bool, max_tokens=None, temperature=None, slot=CHAT_SLOT):
     """Yields ('reasoning', '') while the model thinks and ('content', text) as it answers."""
-    payload = {"model": "local", "stream": True, "messages": messages}
+    payload = {"model": "local", "stream": True, "messages": messages, "id_slot": slot}
     if not think:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     if max_tokens:
@@ -340,7 +359,8 @@ def extract_memories(user_text: str, reply: str) -> None:
         ]
         try:
             with BRAIN.use():
-                out = "".join(v for k, v in llm_stream(msgs, think=False, max_tokens=150, temperature=0.2)
+                out = "".join(v for k, v in llm_stream(msgs, think=False, max_tokens=150, temperature=0.2,
+                                                       slot=MEMORY_SLOT)
                               if k == "content")
         except Exception:
             return

@@ -13,8 +13,15 @@ mmproj = "models/mmproj-Qwen3.6-35B-A3B-F16.gguf"   # vision. Set to "" to turn 
 n_cpu_moe = 31
 threads = 16
 context = 32768
-extra_flags = ["-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"]
+# --no-cache-idle-slots keeps the chat's cache in place while memory learning runs,
+# so each new message only reads the new part instead of the whole chat again.
+extra_flags = ["-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja",
+               "--no-cache-idle-slots"]
 port = 8080
+
+# Max "thinking" tokens in Smart mode before it must answer (-1 = no limit).
+# At about 21 tok/s, 600 tokens is up to about 30 s of thinking.
+reasoning_budget = 600
 
 # Stop the brain after this many minutes with no chat, to free RAM and VRAM
 # and let the laptop cool down. It wakes up again on your next message.

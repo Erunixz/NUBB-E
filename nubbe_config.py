@@ -25,6 +25,7 @@ DEFAULTS = {
         "context": 32768,
         "extra_flags": ["-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"],
         "port": 8080,
+        "reasoning_budget": 600,
         "idle_unload_minutes": 10,
     },
     "app": {
@@ -73,6 +74,9 @@ def llama_args(brain: dict) -> list:
         args += ["--n-cpu-moe", str(brain["n_cpu_moe"])]
     if brain.get("threads"):
         args += ["-t", str(brain["threads"])]
+    if brain.get("reasoning_budget", -1) >= 0:
+        args += ["--reasoning-budget", str(brain["reasoning_budget"]),
+                 "--reasoning-budget-message", "Okay, I've thought enough. Time to answer."]
     args += ["-c", str(brain["context"]), *brain["extra_flags"], "--port", str(brain["port"])]
     return args
 

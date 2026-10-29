@@ -145,6 +145,7 @@ def owned_brain(monkeypatch, data_dir):
 # chats
 # ---------------------------------------------------------------------------
 def test_create_chat_and_stream_reply(base, fake):
+    post(base, "/api/settings", {"think": True})
     events = chat(base, "Hey NUBB-E, how are you?")
     kinds = [e["type"] for e in events]
     assert kinds[0] == "start" and kinds[-1] == "done"
@@ -209,6 +210,13 @@ def test_no_memory_from_small_talk(base, fake):
     assert get(base, "/api/memory") == []
 
 
+def test_chat_and_memory_use_separate_slots(base, fake):
+    chat(base, "My laptop has an RTX 4060.")
+    assert wait_for(lambda: len(extract_requests(fake)) == 1)
+    assert chat_requests(fake)[-1]["id_slot"] == app.CHAT_SLOT
+    assert extract_requests(fake)[-1]["id_slot"] == app.MEMORY_SLOT != app.CHAT_SLOT
+
+
 def test_memory_included_in_system_prompt(base, fake):
     post(base, "/api/memory", {"text": "Erfan is building NUBB-E"})
     chat(base, "What am I working on?")
@@ -235,8 +243,7 @@ def test_voice_adds_rules_and_limits_tokens(base, fake):
 
 
 def test_settings_toggles(base, fake):
-    assert get(base, "/api/settings") == {"auto_memory": True, "think": True}
-    assert post(base, "/api/settings", {"think": False}) == {"auto_memory": True, "think": False}
+    assert get(base, "/api/settings") == {"auto_memory": True, "think": False}   # Fast by default
     events = chat(base, "Fast mode please")
     assert chat_requests(fake)[-1]["chat_template_kwargs"] == {"enable_thinking": False}
     assert "reasoning" not in [e["type"] for e in events]
@@ -294,7 +301,7 @@ def test_db_deleted_while_running(base, fake, data_dir):
     for f in data_dir.glob("nubbe.db*"):
         f.unlink()
     assert get(base, "/api/chats") == []          # fresh, empty DB instead of a crash
-    assert get(base, "/api/settings") == {"auto_memory": True, "think": True}
+    assert get(base, "/api/settings") == {"auto_memory": True, "think": False}
     assert reply_of(chat(base, "After")) == REPLY
     assert len(get(base, "/api/chats")) == 1
 

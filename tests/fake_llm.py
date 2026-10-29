@@ -16,7 +16,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-REPLY = "Hi Erfan! I'm NUBB-E, ready to build. *happy beep*"
+REPLY = "Hi Erfan! I'm NUBB-E, ready to build."
 FACT = "Erfan's laptop has an RTX 4060 GPU"
 
 
