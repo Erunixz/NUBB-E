@@ -6,25 +6,27 @@ The full setup guide comes later. For now, this covers voice.
 
 ## Voice
 
-Press the mic button in the app, talk, and NUBB-E answers out loud. Press it again while you're talking to send right away, or while it's talking to make it stop.
+Press **Call** in the app and just talk, like a phone call. NUBB-E answers out loud when you pause, then listens again. Talk over it to interrupt. Press **End call** to hang up. Each call is saved as one "Call:" chat.
+
+Headphones work best. With laptop speakers, NUBB-E filters out its own voice so it doesn't interrupt itself, but loud speakers can still confuse it, so keep the volume moderate.
 
 Speech runs on the CPU, so the GPU stays free for the brain:
 
 - **Ears:** Whisper `base.en` (faster-whisper)
-- **Voice:** Kokoro-82M, voice `am_michael` (change `kokoro_voice` in `config.toml`)
+- **Voice:** Kokoro-82M, voice `am_puck` (change `kokoro_voice` in `config.toml`)
 - **Backup voice:** Piper `en_US-amy-medium` in `voices/`, used only if Kokoro can't load
 
 ### One-time setup
 
 1. Install espeak-ng (Kokoro uses it for unusual words): `winget install eSpeak-NG.eSpeak-NG`
 2. Install the Python parts: `.venv\Scripts\python -m pip install -r requirements.txt`
-3. With internet on, start voice once (press the mic button, or run `.venv\Scripts\python nubbe_voice.py`). It downloads the speech models (about 800 MB) to `~/.cache/huggingface`.
+3. With internet on, start voice once (press Call, or run `.venv\Scripts\python nubbe_voice.py`). It downloads the speech models (about 800 MB) to `~/.cache/huggingface`.
 
 ### Offline
 
 After that first run, voice works with no internet. NUBB-E loads the speech models from the local cache with `HF_HUB_OFFLINE=1` set automatically, so it never waits on the network. It only goes online if the models are missing.
 
-To check it yourself: turn Wi-Fi off, start the app, and press the mic button.
+To check it yourself: turn Wi-Fi off, start the app, and press Call.
 
 ### Mic too sensitive, or not hearing you?
 

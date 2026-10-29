@@ -231,15 +231,15 @@ def test_memory_included_in_system_prompt(base, fake):
 def test_voice_adds_rules_and_limits_tokens(base, fake):
     events = chat(base, "Quick question", voice=True)
     req = chat_requests(fake)[-1]
-    assert "## Voice mode" in req["messages"][0]["content"]
-    assert req["max_tokens"] == 80
+    assert "## Voice call" in req["messages"][0]["content"]
+    assert req["max_tokens"] == 120
     assert req["chat_template_kwargs"] == {"enable_thinking": False}
     assert "reasoning" not in [e["type"] for e in events]
     assert get(base, "/api/chats")[0]["title"].startswith("Voice: ")
     # normal chats don't get voice rules
     chat(base, "Normal question")
     req = chat_requests(fake)[-1]
-    assert "## Voice mode" not in req["messages"][0]["content"] and "max_tokens" not in req
+    assert "## Voice call" not in req["messages"][0]["content"] and "max_tokens" not in req
 
 
 def test_settings_toggles(base, fake):
@@ -516,15 +516,24 @@ def test_mic_button_endpoint(base, fake, monkeypatch):
         post(base, "/api/voice", {"action": "dance"})
     assert e.value.code == 400
     sent = []
-    monkeypatch.setattr(app, "VOICE", type("V", (), {"send": lambda self, a: sent.append(a) or "ok"})())
-    assert post(base, "/api/voice", {"action": "listen"}) == {"voice": "ok"}
-    assert post(base, "/api/voice", {"action": "stop"}) == {"voice": "ok"}
-    assert sent == ["listen", "stop"]
+    monkeypatch.setattr(app, "VOICE", type("V", (), {"in_call": False, "send": lambda self, a: sent.append(a) or "ok"})())
+    for action in ("call", "hangup", "listen", "stop"):
+        assert post(base, "/api/voice", {"action": action}) == {"voice": "ok", "in_call": False}
+    assert sent == ["call", "hangup", "listen", "stop"]
 
 
 def test_voice_stop_when_not_running_does_nothing():
     v = app.Voice()
-    assert v.send("stop") == "off" and v.proc is None    # "stop" never starts the voice helper
+    for cmd in ("stop", "hangup"):
+        assert v.send(cmd) == "off" and v.proc is None    # these never start the voice helper
+    assert v.in_call is False
+
+
+def test_call_chats_are_titled_call(base, fake):
+    cid = chat(base, "Hey, how's it going?", voice=True, source="call")[0]["chat_id"]
+    chat(base, "Cool, and you?", voice=True, source="call", chat_id=cid)
+    assert [c["title"] for c in get(base, "/api/chats")] == ["Call: Hey, how's it going?"]
+    assert len(get(base, f"/api/chats/{cid}")) == 4
 
 
 def test_voice_chats_use_their_own_brain_slot(base, fake):

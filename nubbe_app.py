@@ -2,8 +2,8 @@
 """NUBB-E app: one launcher for everything, fully offline.
 
     python nubbe_app.py
-cdcdef
 
+What it does:
   - starts the brain (llama-server) if it isn't running yet
   - opens a NUBB-E window: animated face on top, chat below
   - saves every chat (sidebar, like any chat app)
@@ -75,12 +75,17 @@ from nubbe_face import FACE_JS, FACE_STATES   # shared face engine (keep nubbe_f
 from nubbe_quick import QUICK_PAGE            # quick bar page (keep nubbe_quick.py next to this file)
 
 VOICE_RULES = (
-    "\n\n## Voice mode\n"
-    "You are speaking out loud right now. Reply in ONE short sentence, like a quick spoken reply. "
-    "Only go longer if Erfan explicitly asks for detail. "
-    "No markdown, no lists, no code blocks, no emoji: everything you write is read aloud. "
-    "Out loud you may add a little robot sound now and then, like *happy beep* or *nerd beep*, "
-    "but sparingly, never in every reply."
+    "\n\n## Voice call\n"
+    "You're on a voice call with Erfan, talking out loud like a friend on the phone. "
+    "Keep it short and natural: usually one to three short sentences. React like a person "
+    "(\"oh nice\", \"hmm\", \"wait, really?\") and sometimes ask something back. "
+    "Only go longer if he asks for detail. Don't end every reply with a question. "
+    "You can't hear your own voice, so if he says you pronounce a word wrong, fix it: add "
+    "[say: word = spelling] at the very end, spelled so it sounds right when read aloud "
+    "(for example [say: Erfan = Er-fawn]), and just say thanks. "
+    "No markdown, no lists, no code blocks, no emoji: everything you write is read aloud, "
+    "so say code and symbols in plain words. "
+    "Now and then you may add a little robot sound, like *happy beep*, but rarely."
 )
 
 EXTRACT_PROMPT = (
@@ -331,19 +336,25 @@ def warm_slot(system: str, slot: int) -> None:
 
 
 class Voice:
-    """The mic button: runs nubbe_voice.py --serve in the background (speech models load once,
-    on the CPU) and sends it one command per line: listen / stop / quit."""
+    """The call button: runs nubbe_voice.py --serve in the background (speech models load once,
+    on the CPU) and sends it one command per line: call / hangup / listen / stop / quit."""
 
     def __init__(self):
         self.proc = None
         self.job = None
         self.log = None
+        self.in_call = False
         self.lock = threading.Lock()
 
     def send(self, cmd: str) -> str:
         with self.lock:
+            if cmd in ("call", "hangup"):
+                self.in_call = cmd == "call"
+            elif cmd == "stop":
+                self.in_call = False
             if self.proc is None or self.proc.poll() is not None:
-                if cmd != "listen":
+                self.in_call = self.in_call and cmd == "call"
+                if cmd not in ("listen", "call"):
                     return "off"
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
                 if self.log:
@@ -354,7 +365,7 @@ class Voice:
                     stdin=subprocess.PIPE, stdout=self.log, stderr=subprocess.STDOUT, text=True,
                     env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1"))
                 self.job = tie_to_app(self.proc)
-                broadcast({"state": "thinking", "status": "loading voice..."})
+                broadcast({"state": "thinking", "status": "connecting..."})
                 status = "starting"
                 if llm_alive():   # get the brain's voice slot ready while the speech models load
                     threading.Thread(target=warm_slot, args=(system_prompt() + VOICE_RULES, VOICE_SLOT),
@@ -370,6 +381,7 @@ class Voice:
 
     def stop(self) -> None:
         with self.lock:
+            self.in_call = False
             p, self.proc = self.proc, None
             if p and p.poll() is None:
                 try:
@@ -569,12 +581,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/chat":
             self.chat(body)
-        elif path == "/api/voice":   # the mic button
+        elif path == "/api/voice":   # the call button
             action = body.get("action")
-            if action not in ("listen", "stop"):
+            if action not in ("call", "hangup", "listen", "stop"):
                 self.send_error(400)
                 return
-            self.send_json({"voice": VOICE.send(action)})
+            self.send_json({"voice": VOICE.send(action), "in_call": VOICE.in_call})
         elif path == "/api/look":
             self.chat(body, look=True)
         elif path == "/state":  # set_face() from other scripts
@@ -650,7 +662,8 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         chat_id = body.get("chat_id")
         if not chat_id or not rows("SELECT id FROM chats WHERE id = ?", (chat_id,)):
-            title = ("Voice: " if voice else "Quick: " if body.get("source") == "quick"
+            title = ("Call: " if voice and body.get("source") == "call" else "Voice: " if voice
+                     else "Quick: " if body.get("source") == "quick"
                      else "Look: " if look else "") + title_from(text)
             chat_id = run("INSERT INTO chats(title, created, updated) VALUES (?, ?, ?)", (title, now, now))
         run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'user', ?, ?)",
@@ -680,7 +693,7 @@ class Handler(BaseHTTPRequestHandler):
                         if BRAIN.can_start else
                         "My brain isn't running. Start llama-server, or start me without --no-brain.")})
                     return
-                for kind, val in llm_stream(messages, think=think, max_tokens=80 if voice else None,
+                for kind, val in llm_stream(messages, think=think, max_tokens=120 if voice else None,
                                             slot=LOOK_SLOT if look else VOICE_SLOT if voice else CHAT_SLOT):
                     if kind == "reasoning":
                         if not told_reasoning:
@@ -700,6 +713,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             if reply:
                 try:
+                    if voice:   # [say: word = spelling] is a note for the voice, not part of the chat
+                        reply = re.sub(r"\s*\[say:[^\]]*\]", "", reply).strip() or reply
                     run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'assistant', ?, ?)",
                         (chat_id, reply, time.time()))
                     run("UPDATE chats SET updated = ? WHERE id = ?", (time.time(), chat_id))
@@ -912,7 +927,7 @@ PAGE = r"""<!doctype html>
   .look { padding: 10px 14px; border-radius: 12px; border: 1px solid var(--glow); color: var(--glow);
           white-space: nowrap; }
   .look:disabled { opacity: .4; cursor: default; }
-  .mic { padding: 10px 13px; border-radius: 12px; border: 1px solid var(--line); color: var(--muted); }
+  .mic { padding: 10px 13px; white-space: nowrap; border-radius: 12px; border: 1px solid var(--line); color: var(--muted); }
   .mic.listening { border-color: #ff6b8b; color: #ff6b8b; box-shadow: 0 0 12px #ff6b8b55; }
   .mic.busy { border-color: var(--glow); color: var(--glow); }
 
@@ -950,7 +965,7 @@ PAGE = r"""<!doctype html>
   <form id="composer">
     <button type="button" class="mode" id="modeBtn" title="Smart reasons before answering; Fast skips it">Smart</button>
     <textarea id="input" rows="1" placeholder="Talk to NUBB-E...  (/remember something to save it)"></textarea>
-    <button type="button" class="mic" id="micBtn" title="Talk to NUBB-E (press, talk, it answers out loud). Press again to stop.">&#127908;</button>
+    <button type="button" class="mic" id="micBtn" title="Start a voice call: just talk, NUBB-E answers out loud. You can interrupt it.">&#128222; Call</button>
     <button type="button" class="look" id="lookBtn" title="NUBB-E takes a screenshot and answers your question about it">Look</button>
     <button class="send" id="sendBtn">Send</button>
   </form>
@@ -1095,18 +1110,24 @@ async function send(text, look = false) {
   busy = false; sendBtn.disabled = false; $('lookBtn').disabled = false; loadChats(); input.focus();
 }
 
-// mic button: the voice helper reports listening / thinking / talking / idle through the face events
-function showMic(state, status) {
+// call button: a hands-free voice call. The voice helper reports listening / thinking / talking
+// through the face events; the button shows whether a call is on.
+let inCall = false;
+function showCall(on) {
+  inCall = on;
   const b = $('micBtn');
-  b.classList.toggle('listening', state === 'listening');
-  b.classList.toggle('busy', state === 'thinking' || state === 'talking');
-  b.title = state === 'listening' ? 'Listening... press to stop and answer now'
-          : (state === 'talking' || state === 'thinking') ? (status === 'loading voice...' ? 'Loading voice (first time takes a bit)' : 'Press to stop')
-          : 'Talk to NUBB-E (press, talk, it answers out loud). Press again to stop.';
+  b.classList.toggle('listening', on);
+  b.innerHTML = on ? '&#128222; End call' : '&#128222; Call';
+  b.title = on ? 'Hang up' : 'Start a voice call: just talk, NUBB-E answers out loud. You can interrupt it.';
+}
+function showMic(state, status) {
+  if (state === 'idle' && status === 'Call ended') showCall(false);
+  if (status === "Can't open the mic.") { showCall(false); faceStatus.textContent = "can't open the mic"; }
 }
 $('micBtn').onclick = async () => {
-  const r = await api('/api/voice', { action: 'listen' });
-  if (r.voice === 'starting') { setFace('thinking'); faceStatus.textContent = 'loading voice...'; showMic('thinking', 'loading voice...'); }
+  const r = await api('/api/voice', { action: inCall ? 'hangup' : 'call' });
+  showCall(r.in_call);
+  if (r.voice === 'starting') { setFace('thinking'); faceStatus.textContent = 'connecting...'; }
 };
 
 $('lookBtn').onclick = () => {   // the question box is optional: empty means "what's on my screen?"

@@ -16,8 +16,9 @@ context = 32768
 # --no-cache-idle-slots keeps the chat's cache in place while memory learning runs,
 # so each new message only reads the new part instead of the whole chat again.
 # --parallel 4: one brain slot each for chat, memory learning, Look and voice.
+# --kv-unified: all slots share the full 32k context (without it, each slot only gets 8k).
 extra_flags = ["-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja",
-               "--no-cache-idle-slots", "--parallel", "4"]
+               "--no-cache-idle-slots", "--parallel", "4", "--kv-unified"]
 port = 8080
 
 # Max "thinking" tokens in Smart mode before it must answer (-1 = no limit).
@@ -46,7 +47,14 @@ close_to_background = true     # closing the app window keeps NUBB-E running for
 
 [voice]
 whisper_model = "base.en"    # tiny.en / base.en / small.en (base.en: 0.6 s per question on this CPU, small.en: 1.9 s)
-kokoro_voice = "am_michael"          # picked by Erfan in Phase 5
-kokoro_speed = 1.05
+kokoro_voice = "am_puck"             # picked by Erfan in Phase 5 (playful)
+kokoro_speed = 1.0
 piper_voice = "voices/en_US-amy-medium.onnx"   # backup voice if Kokoro cannot load
-mic_threshold = 0.015        # mic loudness that counts as talking (tuned in Phase 5)
+mic_threshold = 0.001         # mic loudness that counts as talking (tuned in Phase 5)
+barge_in = true               # talk over NUBB-E to interrupt it (it pauses, and resumes if it was just a noise)
+
+# How to say names out loud (Kokoro reads the spelling on the right).
+# Words you correct during a call are saved in ~/.nubbe/say.json.
+[voice.say]
+"Erfan" = "Er-fawn"
+"NUBB-E" = "Noobee"

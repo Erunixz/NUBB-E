@@ -38,9 +38,11 @@ DEFAULTS = {
     "voice": {
         "whisper_model": "base.en",
         "kokoro_voice": "af_heart",
-        "kokoro_speed": 1.05,
+        "kokoro_speed": 1.0,
         "piper_voice": "",
         "mic_threshold": 0.015,
+        "barge_in": True,
+        "say": {"Erfan": "Er-fawn", "NUBB-E": "Noobee"},
     },
 }
 
