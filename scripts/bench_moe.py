@@ -13,6 +13,7 @@ Standard library only. Needs nvidia-smi for the VRAM column.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -38,7 +39,8 @@ def vram_used_mb():
 
 def run_one(args, ncmoe):
     cmd = [str(args.bench), "-m", str(args.model), "-ngl", "99",
-           "--n-cpu-moe", str(ncmoe), "-fa", "1", "-ctk", "q8_0", "-ctv", "q8_0",
+           "--n-cpu-moe", str(ncmoe), "-t", str(args.threads),
+           "-fa", "1", "-ctk", "q8_0", "-ctv", "q8_0",
            "-p", str(args.prompt), "-n", str(args.gen), "-r", str(args.reps),
            "-o", "json"]
     peak = [0]
@@ -87,6 +89,8 @@ def main():
     ap.add_argument("--prompt", type=int, default=512, help="prompt tokens to test")
     ap.add_argument("--gen", type=int, default=128, help="tokens to generate")
     ap.add_argument("--reps", type=int, default=2)
+    ap.add_argument("--threads", type=int, default=os.cpu_count() or 8,
+                    help="CPU threads for the experts kept in RAM (default: all)")
     ap.add_argument("--timeout", type=int, default=600, help="seconds per run")
     args = ap.parse_args()
 
