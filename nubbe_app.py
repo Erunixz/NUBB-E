@@ -12,6 +12,8 @@ What it does:
   - /remember <fact> in the chat saves a memory directly
   - nubbe_voice.py talks through the app too, so voice chats are saved
     and NUBB-E learns from them automatically
+  - puts the brain to sleep after idle_unload_minutes with no chat (frees
+    RAM and VRAM), and wakes it up again on your next message
 
 Everything is stored on your PC in ~/.nubbe/nubbe.db. Nothing goes online.
 Standard library only. Optional: `pip install pywebview` for a real app
@@ -20,12 +22,15 @@ window instead of a browser window.
 Flags:
   --no-brain    don't start llama-server (you run it yourself)
   --browser     open in your normal browser instead of an app window
+  --no-window   don't open a window, just serve the page
 """
 import argparse
+import atexit
 import json
 import queue
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -34,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
-from contextlib import closing
+from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -87,6 +92,8 @@ DEFAULT_SETTINGS = {"auto_memory": "1", "think": "1"}
 
 
 def connect() -> sqlite3.Connection:
+    if not DB_PATH.exists():   # deleted while running: start fresh instead of crashing
+        init_db()
     con = sqlite3.connect(DB_PATH, timeout=10)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
@@ -105,7 +112,7 @@ def run(sql: str, args=()) -> int:
 
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with closing(connect()) as con, con:
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as con, con:
         con.executescript(SCHEMA)
         con.execute("PRAGMA journal_mode = WAL")
         for k, v in DEFAULT_SETTINGS.items():
@@ -132,18 +139,149 @@ def llm_alive() -> bool:
         return False
 
 
-def start_llm():
-    if llm_alive():
-        print("Brain already running.")
+def tie_to_app(proc):
+    """Windows: put the brain in a job that closes with the app, so llama-server can never
+    outlive NUBB-E (even if the app crashes or its console is closed). Returns the job handle."""
+    if sys.platform != "win32":
         return None
-    exe = LLAMA_SERVER if Path(LLAMA_SERVER).exists() else shutil.which(CFG["brain"]["llama_server"])
-    if not exe:
-        print(f"Couldn't find llama-server ('{LLAMA_SERVER}'). Set llama_server in "
-              "config.toml, or start it yourself and use --no-brain.")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("Basic", Basic), ("Io", ctypes.c_uint64 * 6), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        job = k32.CreateJobObjectW(None, None)
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000   # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        k32.SetInformationJobObject(wintypes.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info))
+        k32.AssignProcessToJobObject(wintypes.HANDLE(job), wintypes.HANDLE(proc._handle))
+        return job
+    except Exception:
         return None
-    log = open(DATA_DIR / "llama-server.log", "w")
-    print("Starting the brain (first load can take a minute)...")
-    return subprocess.Popen([exe, *LLAMA_ARGS], stdout=log, stderr=subprocess.STDOUT)
+
+
+class Brain:
+    """Owns llama-server: starts it, wakes it on demand, and puts it to sleep when idle.
+    Only a brain this app started is ever stopped."""
+
+    def __init__(self, can_start=True, idle_minutes=0.0):
+        self.can_start = can_start
+        self.idle_seconds = idle_minutes * 60
+        self.proc = None
+        self.job = None
+        self.log = None
+        self.asleep = False
+        self.active = 0              # replies in progress (never unload during one)
+        self.last_used = time.time()
+        self.lock = threading.Lock()
+
+    def status(self) -> str:
+        if llm_alive():
+            return "online"
+        if self.proc and self.proc.poll() is None:
+            return "loading"
+        return "asleep" if self.asleep else "offline"
+
+    def start(self) -> bool:
+        """Starts llama-server if it isn't running or loading. Call with self.lock held."""
+        if llm_alive() or (self.proc and self.proc.poll() is None):
+            return True
+        exe = LLAMA_SERVER if Path(LLAMA_SERVER).exists() else shutil.which(CFG["brain"]["llama_server"])
+        if not exe:
+            print(f"Couldn't find llama-server ('{LLAMA_SERVER}'). Set llama_server in "
+                  "config.toml, or start it yourself and use --no-brain.")
+            return False
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if self.log:
+            self.log.close()
+        self.log = open(DATA_DIR / "llama-server.log", "w")
+        print("Starting the brain (first load can take a minute)...")
+        self.proc = subprocess.Popen([exe, *LLAMA_ARGS], stdout=self.log, stderr=subprocess.STDOUT)
+        self.job = tie_to_app(self.proc)
+        self.asleep = False
+        self.last_used = time.time()
+        return True
+
+    def ensure(self, on_wait=None, timeout=600) -> bool:
+        """Makes sure the brain is up, waking it if needed. Calls on_wait() once if we have to wait."""
+        with self.lock:
+            if llm_alive():
+                return True
+            if not self.can_start or not self.start():
+                return False
+        if on_wait:
+            on_wait()
+        end = time.time() + timeout
+        while time.time() < end:
+            if llm_alive():
+                return True
+            if not self.proc or self.proc.poll() is not None:
+                return False   # crashed while loading (see llama-server.log)
+            time.sleep(0.5)
+        return False
+
+    @contextmanager
+    def use(self):
+        """Wrap every brain call in this, so it's never put to sleep mid-reply."""
+        with self.lock:
+            self.active += 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.last_used = time.time()
+
+    def _kill(self) -> None:
+        p, self.proc = self.proc, None
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        if self.log:
+            self.log.close()
+            self.log = None
+
+    def stop(self) -> None:
+        with self.lock:
+            self._kill()
+
+    def sleep_if_idle(self) -> bool:
+        with self.lock:
+            idle = (self.proc and self.proc.poll() is None and not self.active
+                    and time.time() - self.last_used > self.idle_seconds)
+            if idle:
+                self._kill()
+                self.asleep = True
+        if idle:
+            print("No chats for a while: brain is asleep to free memory. It wakes on your next message.")
+            broadcast({"state": "sleep", "status": "asleep"})
+        return bool(idle)
+
+    def watch_idle(self) -> None:
+        if not self.idle_seconds:
+            return
+        while True:
+            time.sleep(min(30.0, max(0.2, self.idle_seconds / 4)))
+            self.sleep_if_idle()
+
+
+BRAIN = Brain(idle_minutes=CFG["brain"]["idle_unload_minutes"])
 
 
 def system_prompt() -> str:
@@ -201,8 +339,9 @@ def extract_memories(user_text: str, reply: str) -> None:
              + f"\n\nErfan said:\n{user_text}\n\nNUBB-E replied:\n{reply[:1500]}"},
         ]
         try:
-            out = "".join(v for k, v in llm_stream(msgs, think=False, max_tokens=150, temperature=0.2)
-                          if k == "content")
+            with BRAIN.use():
+                out = "".join(v for k, v in llm_stream(msgs, think=False, max_tokens=150, temperature=0.2)
+                              if k == "content")
         except Exception:
             return
         seen = {k.lower() for k in known}
@@ -265,6 +404,25 @@ class Handler(BaseHTTPRequestHandler):
 
     # routes
     def do_GET(self):
+        self.guarded(self.get)
+
+    def do_POST(self):
+        self.guarded(self.post)
+
+    def guarded(self, route):
+        """A broken request or DB hiccup gets a clean error, never a crashed handler."""
+        try:
+            route()
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            print(f"Request {self.path} failed: {e}")
+            try:
+                self.send_json({"error": str(e)}, 500)
+            except OSError:
+                pass
+        except OSError:
+            pass   # window closed
+
+    def get(self):
         path = self.path.split("?")[0]
         if path == "/face.js":
             body = FACE_JS.encode()
@@ -283,7 +441,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/events":
             self.events()
         elif path == "/api/health":
-            self.send_json({"brain": llm_alive()})
+            state = BRAIN.status()
+            self.send_json({"brain": state == "online", "state": state})
         elif path == "/api/chats":
             self.send_json(rows("SELECT id, title, updated FROM chats ORDER BY updated DESC"))
         elif m := re.fullmatch(r"/api/chats/(\d+)", path):
@@ -295,11 +454,14 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def do_POST(self):
+    def post(self):
         path = self.path.split("?")[0]
         try:
             body = self.read_json()
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_error(400)
+            return
+        if not isinstance(body, dict):
             self.send_error(400)
             return
         if path == "/api/chat":
@@ -371,26 +533,44 @@ class Handler(BaseHTTPRequestHandler):
 
         self.start_stream()
         reply, told_reasoning = "", False
+
+        def waking():
+            self.emit({"type": "waking"})
+            broadcast({"state": "sleep", "status": "waking up"})
+
         try:
-            self.emit({"type": "start", "chat_id": chat_id})
-            for kind, val in llm_stream(messages, think=think, max_tokens=80 if voice else None):
-                if kind == "reasoning":
-                    if not told_reasoning:
-                        self.emit({"type": "reasoning"})
-                        told_reasoning = True
-                else:
-                    reply += val
-                    self.emit({"type": "delta", "text": val})
-            self.emit({"type": "done"})
+            with BRAIN.use():
+                self.emit({"type": "start", "chat_id": chat_id})
+                if not BRAIN.ensure(on_wait=waking):
+                    self.emit({"type": "error", "text": (
+                        "My brain didn't start. Check ~/.nubbe/llama-server.log to see why."
+                        if BRAIN.can_start else
+                        "My brain isn't running. Start llama-server, or start me without --no-brain.")})
+                    return
+                for kind, val in llm_stream(messages, think=think, max_tokens=80 if voice else None):
+                    if kind == "reasoning":
+                        if not told_reasoning:
+                            self.emit({"type": "reasoning"})
+                            told_reasoning = True
+                    else:
+                        reply += val
+                        self.emit({"type": "delta", "text": val})
+                self.emit({"type": "done"})
+        except urllib.error.HTTPError as e:
+            self.safe_emit({"type": "error", "text": f"My brain had trouble with that one (error {e.code}). Try again?"})
         except urllib.error.URLError:
             self.safe_emit({"type": "error", "text": "Can't reach my brain. Is llama-server still loading?"})
         except OSError:
-            pass  # window closed mid-reply; still save what we have
+            # window closed mid-reply, or the brain dropped the connection; still save what we have
+            self.safe_emit({"type": "error", "text": "Lost the connection to my brain. Try again?"})
         finally:
             if reply:
-                run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'assistant', ?, ?)",
-                    (chat_id, reply, time.time()))
-                run("UPDATE chats SET updated = ? WHERE id = ?", (time.time(), chat_id))
+                try:
+                    run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'assistant', ?, ?)",
+                        (chat_id, reply, time.time()))
+                    run("UPDATE chats SET updated = ? WHERE id = ?", (time.time(), chat_id))
+                except sqlite3.Error as e:
+                    print(f"Couldn't save the reply: {e}")
                 if voice:
                     broadcast({"event": "chat", "chat_id": chat_id})   # window shows the voice chat live
                 if settings["auto_memory"]:
@@ -441,18 +621,34 @@ def main() -> None:
     p.add_argument("--no-brain", action="store_true", help="don't start llama-server")
     p.add_argument("--browser", action="store_true", help="open in a normal browser tab")
     p.add_argument("--port", type=int, default=PORT)
+    p.add_argument("--no-window", action="store_true", help="don't open a window (just serve the page)")
     args = p.parse_args()
 
     init_db()
-    brain = None if args.no_brain else start_llm()
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError:
+        sys.exit(f"Port {args.port} is busy. Is NUBB-E already open? (or change [app] port in config.toml)")
     server.daemon_threads = True
+
+    BRAIN.can_start = not args.no_brain
+    atexit.register(BRAIN.stop)   # always stop the brain we started, however we exit
+    for sig in ("SIGTERM", "SIGBREAK", "SIGHUP"):
+        if hasattr(signal, sig):
+            signal.signal(getattr(signal, sig), lambda *_: sys.exit(0))
+    if llm_alive():
+        print("Brain already running (started outside NUBB-E, so it won't be put to sleep).")
+    elif BRAIN.can_start:
+        with BRAIN.lock:
+            BRAIN.start()
+    threading.Thread(target=BRAIN.watch_idle, daemon=True).start()
+
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{args.port}"
     print(f"NUBB-E is at {url}  (chats and memory saved in {DATA_DIR})")
 
     try:
-        if not open_window(url, args.browser):
+        if args.no_window or not open_window(url, args.browser):
             print("Press Ctrl+C here to shut NUBB-E down.")
             while True:
                 time.sleep(1)
@@ -460,8 +656,7 @@ def main() -> None:
         pass
     finally:
         server.shutdown()
-        if brain:
-            brain.terminate()
+        BRAIN.stop()
         print("bye! *happy beep*")
 
 
@@ -688,7 +883,8 @@ async function send(text) {
         if (!line.startsWith('data:')) continue;
         const ev = JSON.parse(line.slice(5));
         if (ev.type === 'start') { if (chatId !== ev.chat_id) { chatId = ev.chat_id; loadChats(); } }
-        else if (ev.type === 'reasoning') out.innerHTML = '<span class="thinking">thinking...</span>';
+        else if (ev.type === 'waking') { setFace('sleep'); faceStatus.textContent = 'waking up'; out.innerHTML = '<span class="thinking">waking up, one sec...</span>'; }
+        else if (ev.type === 'reasoning') { setFace('thinking'); out.innerHTML = '<span class="thinking">thinking...</span>'; }
         else if (ev.type === 'delta') { reply += ev.text; setFace('talking'); if (!pending) { pending = true; requestAnimationFrame(render); } }
         else if (ev.type === 'error') { out.innerHTML = '<span class="thinking">' + esc(ev.text) + '</span>'; }
       }
@@ -741,14 +937,16 @@ async function addMem() { const v = $('memInput').value.trim(); if (v) { await a
 $('memAdd').onclick = addMem;
 $('memInput').addEventListener('keydown', e => { if (e.key === 'Enter') addMem(); });
 
-// brain status: face sleeps until the model is loaded
+// brain status: face sleeps until the model is loaded, and while it naps after idle time
+const BRAIN_TEXT = { online: 'brain online (offline mode)', loading: 'brain loading...',
+                     asleep: 'brain asleep, wakes when you write', offline: 'brain offline' };
 async function checkBrain() {
-  let up = false;
-  try { up = (await api('/api/health')).brain; } catch (e) {}
+  let up = false, state = 'offline';
+  try { ({ brain: up, state } = await api('/api/health')); } catch (e) { state = 'offline'; }
   $('brainDot').classList.toggle('on', up);
-  $('brainText').textContent = up ? 'brain online (offline mode)' : 'brain loading...';
-  if (up && !brainUp) { setFace('idle'); setFace('excited'); }
-  if (!up && !busy) setFace('sleep');
+  $('brainText').textContent = BRAIN_TEXT[state] || BRAIN_TEXT.offline;
+  if (up && !brainUp && !busy) { setFace('idle'); setFace('excited'); }
+  if (!up && !busy) { setFace('sleep'); if (state === 'loading') faceStatus.textContent = 'waking up'; }
   brainUp = up;
 }
 
@@ -758,7 +956,7 @@ es.onmessage = e => {
   const d = JSON.parse(e.data);
   if (d.event === 'memory' && $('memPanel').classList.contains('open')) loadMemory();
   if (d.event === 'chat' && !busy) { if (chatId === d.chat_id) openChat(d.chat_id); else loadChats(); }
-  if (d.state && !busy) setFace(d.state);
+  if (d.state && !busy) { setFace(d.state); if (d.status) faceStatus.textContent = d.status; }
 };
 
 (async () => {

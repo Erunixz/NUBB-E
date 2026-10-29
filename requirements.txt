@@ -1,1 +1,4 @@
 # NUBB-E dependencies. Core app uses the standard library only.
+
+# tests only
+pytest
