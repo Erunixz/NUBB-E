@@ -1,8 +1,19 @@
 # NUBB-E
 
-NUBB-E ("noobee") is a personal AI that runs on your own laptop: a local brain, an animated face, text and voice chat, saved chats, and a memory about you. It works fully offline.
+NUBB-E ("noobee") is a personal AI that runs on your own laptop: a local brain, an animated face, text and voice chat, saved chats, and a memory about you. It works fully offline, and goes online only to look things up when a question needs it.
 
-The full setup guide comes later. For now, this covers files and voice.
+The full setup guide comes later. For now, this covers the web, files and voice.
+
+## Web
+
+NUBB-E's brain always runs on this laptop. When there's internet, it can also search the web (DuckDuckGo, no account) and read pages, but only when the answer needs it: news, prices, weather, latest versions, a link you give it, or a fact it isn't sure about. "Explain recursion" or "fix my code" never goes online.
+
+- **Sources:** answers that used the web end with links. Click one to open it in your browser.
+- **You're in charge:** say "search for..." or "look it up" to make it search, or tell it not to. The **Web** button in the app turns it off. `web_enabled = false` in `config.toml` turns it off completely.
+- **No internet?** NUBB-E answers from what it knows and tells you it couldn't check online. It never hangs waiting for the network.
+- **Privacy:** only the search words and the pages it opens go online. Your chats, memories and files never do. Each search and page is logged in `~/.nubbe/web.log`.
+
+Works in the app, the quick bar and voice calls.
 
 ## Files
 

@@ -7,6 +7,7 @@ No GPU or model needed.
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -103,6 +104,7 @@ def data_dir(tmp_path, monkeypatch):
     monkeypatch.setitem(app.CURRENT, "chat_id", None)     # shared app state starts fresh in every test
     monkeypatch.setattr(app, "LAST_LOOK", {})
     monkeypatch.setattr(app.tools, "WORKSPACE_DIR", "")   # file tools off unless a test gives a temp workspace
+    monkeypatch.setattr(app.web, "_net", {"online": False, "until": 1e18})   # no real internet in tests
     app.init_db()
     return d
 
@@ -251,7 +253,8 @@ def test_voice_adds_rules_and_limits_tokens(base, fake):
 
 
 def test_settings_toggles(base, fake):
-    assert get(base, "/api/settings") == {"auto_memory": True, "think": False}   # Fast by default
+    assert get(base, "/api/settings") == {"auto_memory": True, "think": False, "web": True,   # Fast by default
+                                          "web_allowed": True}
     events = chat(base, "Fast mode please")
     assert chat_requests(fake)[-1]["chat_template_kwargs"] == {"enable_thinking": False}
     assert "reasoning" not in [e["type"] for e in events]
@@ -263,7 +266,7 @@ def test_settings_toggles(base, fake):
     assert len(extract_requests(fake)) == 1 and get(base, "/api/memory") == []
     assert "chat_template_kwargs" not in chat_requests(fake)[-1]
     post(base, "/api/settings", {"bogus": True})
-    assert get(base, "/api/settings") == {"auto_memory": False, "think": True}
+    assert get(base, "/api/settings") == {"auto_memory": False, "think": True, "web": True, "web_allowed": True}
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +312,7 @@ def test_db_deleted_while_running(base, fake, data_dir):
     for f in data_dir.glob("nubbe.db*"):
         f.unlink()
     assert get(base, "/api/chats") == []          # fresh, empty DB instead of a crash
-    assert get(base, "/api/settings") == {"auto_memory": True, "think": False}
+    assert get(base, "/api/settings") == {"auto_memory": True, "think": False, "web": True, "web_allowed": True}
     assert reply_of(chat(base, "After")) == REPLY
     assert len(get(base, "/api/chats")) == 1
 
@@ -513,7 +516,9 @@ def test_parse_hotkey():
 def test_quick_page_served(base):
     html = urllib.request.urlopen(base + "/quick", timeout=5).read().decode()
     assert "<title>NUBB-E Quick</title>" in html and "/face.js" in html
-    assert "http" not in html.replace("http://", "")      # no online links: works offline
+    for page in (html, urllib.request.urlopen(base + "/", timeout=5).read().decode()):
+        # nothing loaded from the internet (CDNs etc.): works offline
+        assert not re.search(r"""(src|href)\s*=\s*["']?(https?:)?//""", page) and "@import" not in page
 
 
 def test_quick_chats_are_saved_with_title(base, fake, eyes):

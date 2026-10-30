@@ -75,6 +75,7 @@ PROMPT_PATH = HERE / "nubbe_system_prompt.txt"
 from nubbe_face import FACE_JS, FACE_STATES   # shared face engine (keep nubbe_face.py next to this file)
 from nubbe_quick import QUICK_PAGE            # quick bar page (keep nubbe_quick.py next to this file)
 import nubbe_tools as tools                   # file tools, only inside workspace_dir (keep next to this file)
+import nubbe_web as web                       # web search and page reading, only when online (keep next to this file)
 
 VOICE_RULES = (
     "\n\n## Voice call\n"
@@ -89,6 +90,9 @@ VOICE_RULES = (
     "so say code and symbols in plain words. "
     "Now and then you may add a little robot sound, like *happy beep*, but rarely."
 )
+
+VOICE_AFTER_TOOL = ("\n\n(You're on a voice call: answer out loud in one to three short sentences with just the "
+                    "key fact. No lists, no links, no emoji. Say which site it came from.)")
 
 EXTRACT_PROMPT = (
     "You maintain a small memory about the user, Erfan. From the exchange below, list NEW lasting "
@@ -117,7 +121,8 @@ CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY,
 CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, text TEXT NOT NULL, source TEXT, created REAL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
-DEFAULT_SETTINGS = {"auto_memory": "1", "think": "0"}   # Fast by default: Smart thinks first, which is slow
+DEFAULT_SETTINGS = {"auto_memory": "1", "think": "0",   # Fast by default: Smart thinks first, which is slow
+                    "web": "1"}                         # the Web switch (web_enabled = false in config.toml wins)
 CHAT_SLOT, MEMORY_SLOT, LOOK_SLOT, VOICE_SLOT = 0, 1, 2, 3   # fixed brain slots, so each keeps its prompt cached
 LOOK_MEMORY_SECONDS = 600   # a screenshot stays in the conversation (in RAM only) for follow-up questions
 LAST_LOOK: dict[int, dict] = {}   # chat id -> {"image", "msg_id", "time"}; never written to disk
@@ -270,7 +275,7 @@ class Brain:
             if proc.poll() is not None:
                 return
             time.sleep(0.5)
-        warm_slot(system_prompt(with_tools=True), CHAT_SLOT)
+        warm_slot(CHAT_SLOT)
 
     def ensure(self, on_wait=None, timeout=600) -> bool:
         """Makes sure the brain is up, waking it if needed. Calls on_wait() once if we have to wait."""
@@ -342,17 +347,26 @@ class Brain:
 BRAIN = Brain(idle_minutes=CFG["brain"]["idle_unload_minutes"])
 
 
-def tool_list(slot: int):
-    """File tools are offered in text chats (not voice, which stays fast) when the workspace folder exists."""
-    return tools.SCHEMAS if slot == CHAT_SLOT and tools.root() else None
+def setup(slot: int, chat_id=None) -> tuple[str, list | None]:
+    """The system prompt and tools for a reply in this slot (warm-ups use the same, so the cache matches).
+    File tools: text chats only (voice stays fast). Web tools: everywhere, when Web is on and there's internet."""
+    switched_on = web.ENABLED and get_settings().get("web", False)
+    net = switched_on and web.online()     # a local check, cached: normal chats never touch the network
+    files = slot == CHAT_SLOT and tools.root() is not None
+    system = system_prompt(chat_id) + (tools.rules() if files else "") + web.rules(switched_on, net, slot == VOICE_SLOT)
+    if slot == VOICE_SLOT:
+        system += VOICE_RULES
+    offered = (tools.SCHEMAS if files else []) + (web.SCHEMAS if net else [])
+    return system, offered or None
 
 
-def warm_slot(system: str, slot: int) -> None:
+def warm_slot(slot: int) -> None:
     """Sends a tiny hidden message so this slot has the system prompt cached (and the GPU is warm)."""
     try:
         with BRAIN.use():
+            system, offered = setup(slot)
             msgs = [{"role": "system", "content": system}, {"role": "user", "content": "hi"}]
-            for _ in llm_stream(msgs, think=False, max_tokens=1, slot=slot, tools=tool_list(slot)):
+            for _ in llm_stream(msgs, think=False, max_tokens=1, slot=slot, tools=offered):
                 pass
     except Exception:
         pass
@@ -391,7 +405,7 @@ class Voice:
                 broadcast({"state": "thinking", "status": "connecting..."})
                 status = "starting"
                 if llm_alive():   # get the brain's voice slot ready while the speech models load
-                    threading.Thread(target=warm_slot, args=(system_prompt() + VOICE_RULES, VOICE_SLOT),
+                    threading.Thread(target=warm_slot, args=(VOICE_SLOT,),
                                      daemon=True).start()
             else:
                 status = "ok"
@@ -421,7 +435,7 @@ class Voice:
 VOICE = Voice()
 
 
-def system_prompt(chat_id=None, with_tools=False) -> str:
+def system_prompt(chat_id=None) -> str:
     if PROMPT_PATH.exists():
         base = PROMPT_PATH.read_text(encoding="utf-8")
     else:
@@ -438,8 +452,6 @@ def system_prompt(chat_id=None, with_tools=False) -> str:
         base += ("\n\n## Recent conversations with Erfan (other chats)\n"
                  + "\n".join(f"- {r['title']}: {r['summary']}" for r in recent)
                  + "\nBring these up only when they're relevant, like a friend who remembers.")
-    if with_tools and tools.root():
-        base += tools.rules()
     return base
 
 
@@ -638,7 +650,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/memory":
             self.send_json(rows("SELECT id, text, source FROM memories ORDER BY id DESC"))
         elif path == "/api/settings":
-            self.send_json(get_settings())
+            self.send_json({**get_settings(), "web_allowed": web.ENABLED})
         elif path == "/api/current":
             self.send_json(CURRENT)
         elif path == "/api/voice":
@@ -671,6 +683,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(CURRENT)
         elif path == "/api/look":
             self.chat(body, look=True)
+        elif path == "/api/open":        # a link in an answer: open it in the normal browser
+            url = str(body.get("url", ""))
+            ok = url.startswith(("https://", "http://"))
+            if ok:
+                webbrowser.open(url)
+            self.send_json({"ok": ok})
         elif path == "/api/confirm":     # Erfan pressed Yes or No on a tool card
             card = PENDING.get(str(body.get("id", "")))
             if card:
@@ -705,7 +723,7 @@ class Handler(BaseHTTPRequestHandler):
             for k in DEFAULT_SETTINGS:
                 if k in body:
                     run("UPDATE settings SET value = ? WHERE key = ?", ("1" if body[k] else "0", k))
-            self.send_json(get_settings())
+            self.send_json({**get_settings(), "web_allowed": web.ENABLED})
         else:
             self.send_error(404)
 
@@ -778,9 +796,8 @@ class Handler(BaseHTTPRequestHandler):
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{shot['image']}"}}]
             del h["id"]
         slot = VOICE_SLOT if voice else CHAT_SLOT
-        offered = tool_list(slot)
-        messages = [{"role": "system", "content": system_prompt(chat_id, with_tools=bool(offered))
-                     + (VOICE_RULES if voice else "")}] + history
+        system, offered = setup(slot, chat_id)
+        messages = [{"role": "system", "content": system}] + history
         settings = get_settings()
         think = False if voice else settings["think"]
 
@@ -802,6 +819,8 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 for rnd in range(MAX_TOOL_ROUNDS + 1):   # the last round has no tools, so it must answer
                     calls, said = [], ""
+                    if offered and not web.online():     # the internet dropped mid-reply: no more retrying
+                        offered = [t for t in offered if t["function"]["name"] not in web.TOOLS] or None
                     for kind, val in llm_stream(messages, think=think, max_tokens=120 if voice else None,
                                                 slot=slot, tools=offered if rnd < MAX_TOOL_ROUNDS else None):
                         if kind == "reasoning":
@@ -821,6 +840,8 @@ class Handler(BaseHTTPRequestHandler):
                     messages.append({"role": "assistant", "content": said, "tool_calls": calls})
                     for c in calls:
                         messages.append({"role": "tool", "tool_call_id": c["id"], "content": self.use_tool(c)})
+                    if voice:   # a long page pulls replies toward lists; remind it right where it reads the result
+                        messages[-1]["content"] += VOICE_AFTER_TOOL
                     told_reasoning = False
                 self.emit({"type": "done"})
         except urllib.error.HTTPError as e:
@@ -857,9 +878,11 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             tools.log(DATA_DIR / "tools.log", name, {}, "error: arguments weren't valid JSON")
             return "Your tool arguments weren't valid JSON. Try again."
-        line = tools.status(name, args)
+        line = web.status(name, args) if name in web.TOOLS else tools.status(name, args)
         self.emit({"type": "tool", "name": name, "text": line})
         broadcast({"state": "thinking", "status": line[:60]})
+        if name in web.TOOLS:   # read-only, so no card; only the search words or the link go online
+            return web.call(name, args, DATA_DIR / "web.log")
         approved = None
         if tools.needs_yes(name) and name in tools.TOOLS:
             cid = secrets.token_hex(16)
@@ -1058,6 +1081,7 @@ PAGE = r"""<!doctype html>
   .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
   .msg.note { align-self: center; color: var(--muted); font-size: 13px; padding: 4px; }
   .msg .thinking { color: var(--muted); font-style: italic; }
+  a.ext { color: var(--glow); }
   .tool-line { align-self: flex-start; color: var(--muted); font-size: 12px; padding: 0 6px; }
   .tool-line::before { content: "\2192  "; color: var(--glow); }
   .tool-card { align-self: flex-start; max-width: 80%; background: var(--panel); border: 1px solid var(--glow);
@@ -1125,6 +1149,7 @@ PAGE = r"""<!doctype html>
   <div id="msgs"></div>
   <form id="composer">
     <button type="button" class="mode" id="modeBtn" title="Smart reasons before answering; Fast skips it">Smart</button>
+    <button type="button" class="mode" id="webBtn" title="Let NUBB-E search the web when a question needs it (only when there's internet)">Web: on</button>
     <textarea id="input" rows="1" placeholder="Talk to NUBB-E...  (/remember something to save it)"></textarea>
     <button type="button" class="mic" id="micBtn" title="Start a voice call: just talk, NUBB-E answers out loud. You can interrupt it.">&#128222; Call</button>
     <button type="button" class="look" id="lookBtn" title="NUBB-E takes a screenshot and answers your question about it">Look</button>
@@ -1189,9 +1214,17 @@ function esc(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 function md(src) {   // tiny offline markdown: code blocks, inline code, bold, line breaks
   return src.split('```').map((part, i) => {
     if (i % 2) { const nl = part.indexOf('\n'); return '<pre><code>' + esc((nl >= 0 ? part.slice(nl + 1) : part).replace(/\n$/, '')) + '</code></pre>'; }
-    return esc(part).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
+    return esc(part).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+               .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<)]+[^\s<).,;:!?'"])/g,
+                (m, text, url, bare) => '<a class="ext" href="' + (url || bare) + '">' + (text || bare) + '</a>').replace(/\n/g, '<br>');
   }).join('');
 }
+// links in answers (like web sources) open in the normal browser
+document.addEventListener('click', e => {
+  const a = e.target.closest('a.ext'); if (!a) return;
+  e.preventDefault();
+  fetch('/api/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: a.getAttribute('href').replace(/&amp;/g, '&') }) });
+});
 function bubble(role, text) {
   msgs.querySelector('.empty')?.remove();
   const d = document.createElement('div');
@@ -1260,7 +1293,7 @@ async function send(text, look = false) {
         else if (ev.type === 'reasoning') { setFace('thinking'); out.innerHTML = '<span class="thinking">thinking...</span>'; }
         else if (ev.type === 'delta') { reply += ev.text; setFace('talking'); if (!pending) { pending = true; requestAnimationFrame(render); } }
         else if (ev.type === 'error') { out.innerHTML = '<span class="thinking">' + esc(ev.text) + '</span>'; }
-        else if (ev.type === 'tool') { toolLine(out, ev.text); setFace('thinking'); if (!reply) out.innerHTML = '<span class="thinking">...</span>'; }
+        else if (ev.type === 'tool') { toolLine(out, ev.text); setFace('thinking'); faceStatus.textContent = ev.text.slice(0, 40); if (!reply) out.innerHTML = '<span class="thinking">...</span>'; }
         else if (ev.type === 'confirm') { confirmCard(out, ev); setFace('curious'); }
         else if (ev.type === 'confirmed') settleCard(ev.id, ev.ok);
       }
@@ -1343,7 +1376,12 @@ input.addEventListener('input', () => {   // eyes watch what you type, following
 $('newChat').onclick = newChat;
 
 // smart / fast mode
-function showMode() { $('modeBtn').textContent = settings.think ? 'Smart' : 'Fast'; }
+function showMode() {
+  $('modeBtn').textContent = settings.think ? 'Smart' : 'Fast';
+  $('webBtn').textContent = settings.web ? 'Web: on' : 'Web: off';
+  $('webBtn').style.display = settings.web_allowed === false ? 'none' : '';   // web_enabled = false in config.toml
+}
+$('webBtn').onclick = async () => { settings = await api('/api/settings', { web: !settings.web }); showMode(); };
 $('modeBtn').onclick = async () => { settings = await api('/api/settings', { think: !settings.think }); showMode(); };
 
 // memory panel

@@ -22,6 +22,3 @@ voices/
 # --- Logs and local data ---
 *.log
 .nubbe/
-
-# --- NUBB-E's file tools folder (your own files) ---
-workspace/

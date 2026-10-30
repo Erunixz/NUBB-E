@@ -47,6 +47,9 @@ DEFAULTS = {
     "tools": {
         "workspace_dir": "*",
     },
+    "web": {
+        "web_enabled": True,
+    },
 }
 
 

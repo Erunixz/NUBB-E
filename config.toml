@@ -65,3 +65,11 @@ barge_in = true               # talk over NUBB-E to interrupt it (it pauses, and
 # always shows a Yes/No card first. Keys, saved passwords and browser data are never opened.
 # Or set one folder, like "~/Documents/Notes", to keep it to that. "" turns the tools off.
 workspace_dir = "*"
+
+[web]
+# NUBB-E can search the web and read pages, but only when a question needs it (news, prices,
+# weather, latest versions, a link you give it) and only when there's internet. Everything
+# else stays on this laptop. Only the search words and the pages it opens go online,
+# never your chats, memories or files. Each search is logged in ~/.nubbe/web.log.
+# The app has a Web on/off switch too. false here turns it off completely.
+web_enabled = true

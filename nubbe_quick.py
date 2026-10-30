@@ -338,6 +338,7 @@ QUICK_PAGE = r"""<!doctype html>
   #answer { white-space: normal; word-wrap: break-word; }
   #answer pre { background: #ffffff0d; padding: 8px 10px; border-radius: 8px; overflow-x: auto; }
   #answer code { background: #ffffff10; padding: 1px 4px; border-radius: 4px; }
+  #answer a { color: var(--glow); }
   .status { color: var(--muted); font-style: italic; }
   .card { display: none; margin: 0 16px 12px; padding: 10px 12px; border: 1px solid var(--glow); border-radius: 12px; font-size: 14px; }
   .card.show { display: block; }
@@ -386,12 +387,21 @@ function esc(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 function md(src) {
   return src.split('```').map((part, i) => {
     if (i % 2) { const nl = part.indexOf('\n'); return '<pre><code>' + esc((nl >= 0 ? part.slice(nl + 1) : part).replace(/\n$/, '')) + '</code></pre>'; }
-    return esc(part).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
+    return esc(part).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+               .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<)]+[^\s<).,;:!?'"])/g,
+                (m, text, url, bare) => '<a class="ext" href="' + (url || bare) + '">' + (text || bare) + '</a>').replace(/\n/g, '<br>');
   }).join('');
 }
+// links in answers (like web sources) open in the normal browser
+document.addEventListener('click', e => {
+  const a = e.target.closest('a.ext'); if (!a) return;
+  e.preventDefault();
+  fetch('/api/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: a.getAttribute('href').replace(/&amp;/g, '&') }) });
+});
 function plain(src) {   // what Insert pastes: no markdown symbols
   return src.replace(/```[^\n]*\n?/g, '').replace(/\*\*([^*\n]+)\*\*/g, '$1').replace(/__([^_\n]+)__/g, '$1')
-            .replace(/`([^`\n]+)`/g, '$1').replace(/^#+\s*/gm, '').trim();
+            .replace(/`([^`\n]+)`/g, '$1').replace(/^#+\s*/gm, '')
+            .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g, '$1 ($2)').trim();
 }
 function fit() { requestAnimationFrame(() => api() && api().set_height($('bar').offsetHeight)); }
 function status(text) { out.classList.add('show'); answer.innerHTML = '<span class="status">' + esc(text) + '</span>'; fit(); }
