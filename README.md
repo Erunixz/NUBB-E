@@ -2,7 +2,18 @@
 
 NUBB-E ("noobee") is a personal AI that runs on your own laptop: a local brain, an animated face, text and voice chat, saved chats, and a memory about you. It works fully offline.
 
-The full setup guide comes later. For now, this covers voice.
+The full setup guide comes later. For now, this covers files and voice.
+
+## Files
+
+NUBB-E can read and search the files in one folder: `workspace_dir` in `config.toml` (by default the `workspace` folder here, which stays off GitHub). Point it at your notes, for example `workspace_dir = "~/Documents/Notes"`, and ask things like "what's in my notes about the robot arm?".
+
+- **Looking is free:** listing, reading and searching happen right away.
+- **Changing needs your Yes:** before NUBB-E writes a file or runs a command, a card shows the exact file and text, or the exact command. Nothing happens until you press **Yes**. No, closing the window, or 5 minutes with no answer all mean no.
+- **One folder only:** paths outside it are refused, including `..` tricks and links that point outside.
+- **Everything is logged** in `~/.nubbe/tools.log` (file names and commands, not your file contents).
+
+File tools work in the app and the quick bar. Voice calls skip them to stay fast. Set `workspace_dir = ""` to turn them off.
 
 ## Voice
 

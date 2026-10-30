@@ -58,3 +58,9 @@ barge_in = true               # talk over NUBB-E to interrupt it (it pauses, and
 [voice.say]
 "Erfan" = "Er-fawn"
 "NUBB-E" = "Noobee"
+
+[tools]
+# The one folder NUBB-E's file tools can use: read, search, and (only after you press Yes)
+# write files or run commands. Anything outside it is refused. "" turns the tools off.
+# Relative paths are inside this project; "~/Documents/Notes" style paths work too.
+workspace_dir = "workspace"

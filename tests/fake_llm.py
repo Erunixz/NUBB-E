@@ -7,6 +7,9 @@ Speaks the same API the app uses:
   GET  /health                -> 503 while "loading" (--load-seconds), then {"status": "ok"}
   POST /v1/chat/completions   -> streams reasoning_content chunks, then content chunks
 Memory-extraction calls (the app's EXTRACT_PROMPT) get "- fact" lines back.
+Tool calls: put (name, args) pairs in FakeLLM.plan. Each request that offers tools
+then gets the next one back as a streamed tool call; after a tool result it answers
+"From the tool: <result>".
 Ignores any other llama-server flags, so the app can launch it like the real one.
 Every request body is kept in FakeLLM.requests so tests can check what was sent.
 """
@@ -18,11 +21,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPLY = "Hi Erfan! I'm NUBB-E, ready to build."
 FACT = "Erfan's laptop has an RTX 4060 GPU"
+SUMMARY = "Erfan and NUBB-E talked about the RTX 4060 laptop."
 
 
 class FakeLLM:
     def __init__(self, port=0, load_seconds=0.0):
         self.requests: list[dict] = []
+        self.plan: list[tuple[str, dict]] = []
         self.ready_at = time.time() + load_seconds
         fake = self
 
@@ -45,14 +50,20 @@ class FakeLLM:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
                 fake.requests.append(body)
                 system = body["messages"][0]["content"] if body["messages"] else ""
-                if "maintain a small memory" in system:
+                if "Summarize this conversation" in system:
+                    text, thinking = SUMMARY, False
+                elif "maintain a small memory" in system:
                     said = body["messages"][-1]["content"].split("Erfan said:")[-1].split("NUBB-E replied:")[0]
                     # repeats the fact even when it's "already known", so the app's dedupe gets tested
                     text = f"- {FACT}.\n- {FACT}" if "RTX 4060" in said else "NONE"
                     thinking = False
                 else:
-                    text = REPLY
+                    last = body["messages"][-1]
+                    text = f"From the tool: {last['content']}" if last.get("role") == "tool" else REPLY
                     thinking = (body.get("chat_template_kwargs") or {}).get("enable_thinking", True)
+                    if body.get("tools") and fake.plan:
+                        self.tool_call(*fake.plan.pop(0))
+                        return
                 if not body.get("stream"):
                     self.send_json({"choices": [{"message": {"role": "assistant", "content": text}}]})
                     return
@@ -64,6 +75,18 @@ class FakeLLM:
                         self.chunk({"reasoning_content": word})
                 for i in range(0, len(text), 8):
                     self.chunk({"content": text[i:i + 8]})
+                self.wfile.write(b"data: [DONE]\n\n")
+
+            def tool_call(self, name, args):
+                """Streams a tool call the way llama-server does: the name, then the arguments in pieces."""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                raw = json.dumps(args)
+                self.chunk({"tool_calls": [{"index": 0, "id": f"call_{len(fake.requests)}", "type": "function",
+                                            "function": {"name": name, "arguments": ""}}]})
+                for i in range(0, len(raw), 10):
+                    self.chunk({"tool_calls": [{"index": 0, "function": {"arguments": raw[i:i + 10]}}]})
                 self.wfile.write(b"data: [DONE]\n\n")
 
             def chunk(self, delta):

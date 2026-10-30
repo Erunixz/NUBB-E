@@ -30,7 +30,7 @@ _HOME = tempfile.mkdtemp(prefix="nubbe_test_home_")
 os.environ["HOME"] = os.environ["USERPROFILE"] = _HOME
 
 import nubbe_app as app  # noqa: E402
-from fake_llm import FACT, REPLY, FakeLLM  # noqa: E402
+from fake_llm import FACT, REPLY, SUMMARY, FakeLLM  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +70,13 @@ def reply_of(events) -> str:
 
 
 def chat_requests(fake):
-    """Requests the fake brain got for replies (not memory extraction)."""
-    return [r for r in fake.requests if "maintain a small memory" not in r["messages"][0]["content"]]
+    """Requests the fake brain got for replies (not memory learning or chat summaries)."""
+    return [r for r in fake.requests if not any(k in r["messages"][0]["content"]
+                                                for k in ("maintain a small memory", "Summarize this conversation"))]
+
+
+def summary_requests(fake):
+    return [r for r in fake.requests if "Summarize this conversation" in r["messages"][0]["content"]]
 
 
 def extract_requests(fake):
@@ -95,6 +100,9 @@ def data_dir(tmp_path, monkeypatch):
     d = tmp_path / ".nubbe"
     monkeypatch.setattr(app, "DATA_DIR", d)
     monkeypatch.setattr(app, "DB_PATH", d / "nubbe.db")
+    monkeypatch.setitem(app.CURRENT, "chat_id", None)     # shared app state starts fresh in every test
+    monkeypatch.setattr(app, "LAST_LOOK", {})
+    monkeypatch.setattr(app.tools, "WORKSPACE_DIR", "")   # file tools off unless a test gives a temp workspace
     app.init_db()
     return d
 
@@ -425,7 +433,8 @@ def test_look_sends_image_and_saves_only_text(base, fake, eyes):
     assert content[0]["type"] == "text" and content[0]["text"].endswith("What app is this?")
     assert "screenshot of my screen" in content[0]["text"]
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64," + FAKE_SHOT
-    assert sent["id_slot"] == app.LOOK_SLOT
+    assert sent["id_slot"] == app.CHAT_SLOT          # same slot as the chat, so follow-ups reuse the cache
+    assert "Only describe the screen if I ask" in content[0]["text"]   # answer the question, not a screen tour
     cid = events[0]["chat_id"]
     saved = get(base, f"/api/chats/{cid}")
     assert saved[0]["content"] == "[screenshot] What app is this?"     # no image in the DB
@@ -447,9 +456,18 @@ def test_look_default_question_and_follow_up(base, fake, eyes):
     assert chat_requests(fake)[-1]["messages"][-1]["content"][0]["text"].endswith("What's on my screen?")
     chat(base, "And what should I click?", chat_id=cid)
     msgs = chat_requests(fake)[-1]["messages"]
-    # the follow-up keeps the look as text only; the image is sent just once
-    assert msgs[1]["content"] == "[screenshot] What's on my screen?"
-    assert "image_url" not in json.dumps(msgs)
+    # the follow-up still sees the screenshot (kept in RAM for a few minutes), attached to the look message
+    assert msgs[1]["content"][1]["image_url"]["url"].endswith(FAKE_SHOT)
+    assert json.dumps(msgs).count('"type": "image_url"') == 1 and msgs[-1]["content"] == "And what should I click?"
+    # ...but the database only ever has the text marker
+    assert get(base, f"/api/chats/{cid}")[0]["content"] == "[screenshot] What's on my screen?"
+
+
+def test_look_screenshot_forgotten_after_a_while(base, fake, eyes, monkeypatch):
+    cid = look(base, {"message": "What's this error?"})[0]["chat_id"]
+    app.LAST_LOOK[cid]["time"] -= app.LOOK_MEMORY_SECONDS + 1
+    chat(base, "Thanks", chat_id=cid)
+    assert "image_url" not in json.dumps(chat_requests(fake)[-1]["messages"])
 
 
 def test_look_with_vision_off(base, fake, monkeypatch):
@@ -541,3 +559,51 @@ def test_voice_chats_use_their_own_brain_slot(base, fake):
     assert chat_requests(fake)[-1]["id_slot"] == app.VOICE_SLOT
     chat(base, "Normal question")
     assert chat_requests(fake)[-1]["id_slot"] == app.CHAT_SLOT
+
+
+
+# ---------------------------------------------------------------------------
+# quick bar and app window stay on the same chat; learning across chats
+# ---------------------------------------------------------------------------
+def test_current_chat_is_shared(base, fake):
+    assert get(base, "/api/current") == {"chat_id": None}
+    cid = chat(base, "Hello from the app")[0]["chat_id"]
+    assert get(base, "/api/current") == {"chat_id": cid}          # sending makes it current
+    post(base, "/api/current", {"chat_id": None})                 # app window pressed New chat
+    assert get(base, "/api/current") == {"chat_id": None}
+    post(base, "/api/current", {"chat_id": cid})                  # app window opened it again
+    chat(base, "Hi from the quick bar", source="quick", chat_id=get(base, "/api/current")["chat_id"])
+    assert len(get(base, f"/api/chats/{cid}")) == 4 and len(get(base, "/api/chats")) == 1
+    chat(base, "On a call", voice=True, source="call")            # calls don't steal the app's chat
+    assert get(base, "/api/current") == {"chat_id": cid}
+
+
+def test_chats_get_summaries_and_other_chats_are_remembered(base, fake):
+    a = chat(base, "My laptop has an RTX 4060.")[0]["chat_id"]
+    chat(base, "It has 8 GB of VRAM.", chat_id=a)
+    assert wait_for(lambda: len(summary_requests(fake)) == 1)
+    assert wait_for(lambda: not app._memory_lock.locked())
+    assert app.rows("SELECT summary FROM chats WHERE id = ?", (a,))[0]["summary"] == SUMMARY
+    b = chat(base, "New topic: robots!")[0]["chat_id"]
+    system = chat_requests(fake)[-1]["messages"][0]["content"]
+    assert "Recent conversations with Erfan" in system and SUMMARY in system   # chat b knows about chat a
+    chat(base, "More", chat_id=a)
+    assert "Recent conversations with Erfan" not in chat_requests(fake)[-1]["messages"][0]["content"].split(
+        "## What you remember")[0] or SUMMARY not in chat_requests(fake)[-1]["messages"][0]["content"]
+
+
+def test_feedback_is_part_of_memory_learning():
+    assert "feedback about how NUBB-E should talk" in app.EXTRACT_PROMPT
+
+
+def test_call_state_is_shared(base, fake, monkeypatch):
+    monkeypatch.setattr(app, "VOICE", type("V", (), {"in_call": False,
+                                                     "send": lambda self, a: setattr(self, "in_call", a == "call") or "ok"})())
+    assert get(base, "/api/voice") == {"in_call": False}
+    post(base, "/api/voice", {"action": "call"})
+    assert get(base, "/api/voice") == {"in_call": True}
+    # the voice helper says the call ended by itself (e.g. mic problem): buttons go back to Call
+    req = urllib.request.Request(base + "/state", data=json.dumps({"state": "idle", "text": "Call ended"}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=5).close()
+    assert get(base, "/api/voice") == {"in_call": False}

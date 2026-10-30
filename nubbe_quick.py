@@ -329,6 +329,9 @@ QUICK_PAGE = r"""<!doctype html>
   button:hover { color: var(--text); border-color: var(--glow); }
   button:disabled { opacity: .4; cursor: default; }
   .look { color: var(--glow); border-color: var(--glow); }
+  .call.on { color: #ff6b8b; border-color: #ff6b8b; }
+  .chatname { padding: 0 16px 6px; color: var(--muted); font-size: 12px; display: none; }
+  .chatname.show { display: block; }
   .icon { padding: 6px 9px; }
   #out { display: none; padding: 0 16px 12px; max-height: 330px; overflow-y: auto; }
   #out.show { display: block; }
@@ -336,6 +339,11 @@ QUICK_PAGE = r"""<!doctype html>
   #answer pre { background: #ffffff0d; padding: 8px 10px; border-radius: 8px; overflow-x: auto; }
   #answer code { background: #ffffff10; padding: 1px 4px; border-radius: 4px; }
   .status { color: var(--muted); font-style: italic; }
+  .card { display: none; margin: 0 16px 12px; padding: 10px 12px; border: 1px solid var(--glow); border-radius: 12px; font-size: 14px; }
+  .card.show { display: block; }
+  .card pre { max-height: 140px; overflow: auto; background: #ffffff0d; padding: 8px 10px; border-radius: 8px;
+              white-space: pre-wrap; word-break: break-word; margin: 8px 0; }
+  .cardbtns { display: flex; gap: 8px; }
   .actions { display: none; gap: 8px; padding: 0 16px 12px; }
   .actions.show { display: flex; }
   .hint { margin-left: auto; color: var(--muted); font-size: 12px; align-self: center; }
@@ -347,10 +355,16 @@ QUICK_PAGE = r"""<!doctype html>
     <div class="face pywebview-drag-region" id="faceBox" title="Drag to move"><canvas id="c"></canvas></div>
     <textarea id="input" rows="1" placeholder="Ask NUBB-E...  (Enter: send, Ctrl+Enter: Look, Esc: hide)"></textarea>
     <button class="look" id="lookBtn" title="Read the screen behind this bar">Look</button>
+    <button class="icon call" id="callBtn" title="Start a voice call">&#128222;</button>
     <button class="icon" id="appBtn" title="Open the NUBB-E app">&#9634;</button>
     <button class="icon" id="quitBtn" title="Quit NUBB-E">&times;</button>
   </div>
+  <div class="chatname" id="chatName"></div>
   <div id="out"><div id="answer"></div></div>
+  <div class="card" id="card">
+    <div id="cardTitle"></div><pre id="cardDetail"></pre>
+    <div class="cardbtns"><button id="cardNo">No</button><button class="look" id="cardYes">Yes, do it</button><span class="hint" id="cardAnswer"></span></div>
+  </div>
   <div class="actions" id="actions">
     <button id="insertBtn" title="Paste this answer where your cursor was">Insert</button>
     <button id="copyBtn">Copy</button>
@@ -409,6 +423,9 @@ async function ask(text, look) {
         else if (ev.type === 'reasoning') { face('thinking'); status('thinking...'); }
         else if (ev.type === 'delta') { reply += ev.text; face('talking'); if (!pending) { pending = true; requestAnimationFrame(render); } }
         else if (ev.type === 'error') status(ev.text);
+        else if (ev.type === 'tool') { face('thinking'); if (!reply) status(ev.text + '...'); }
+        else if (ev.type === 'confirm') { confirmCard(ev); face('curious'); }
+        else if (ev.type === 'confirmed') settleCard(ev.ok);
       }
     }
     if (reply) { render(); actions.classList.add('show'); fit(); }
@@ -417,6 +434,29 @@ async function ask(text, look) {
   busy = false; $('lookBtn').disabled = false; input.focus();
 }
 
+// a Yes/No card before NUBB-E changes a file or runs a command (No is the default)
+let cardId = null;
+function confirmCard(ev) {
+  cardId = ev.id;
+  $('cardTitle').textContent = ev.title + ': ' + ev.target; $('cardDetail').textContent = ev.detail;
+  $('cardAnswer').textContent = ''; $('card').querySelectorAll('button').forEach(b => b.disabled = false);
+  $('card').classList.add('show'); $('cardNo').focus(); fit();
+}
+function settleCard(ok) {
+  if (!cardId) return;
+  cardId = null; $('card').querySelectorAll('button').forEach(b => b.disabled = true);
+  $('cardAnswer').textContent = ok ? 'You said Yes.' : 'Not done.';
+  setTimeout(() => { if (!cardId) { $('card').classList.remove('show'); fit(); } }, 1500);
+  input.focus();
+}
+function answerCard(ok) {
+  if (!cardId) return;
+  fetch('/api/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: cardId, ok }) });
+  settleCard(ok);
+}
+$('cardNo').onclick = () => answerCard(false);
+$('cardYes').onclick = () => answerCard(true);
+
 function send(look) {
   const text = input.value.trim() || (look ? "What's on my screen?" : '');
   if (!text) return;
@@ -424,11 +464,11 @@ function send(look) {
   ask(text, look);
 }
 input.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { e.preventDefault(); api() && api().hide(); }
+  if (e.key === 'Escape') { e.preventDefault(); answerCard(false); api() && api().hide(); }   // hiding says No to an open card
   else if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); send(true); }
   else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(false); }
 });
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && e.target !== input) api() && api().hide(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && e.target !== input) { answerCard(false); api() && api().hide(); } });
 input.addEventListener('input', () => { input.style.height = ''; input.style.height = Math.min(input.scrollHeight, 120) + 'px'; fit(); });
 $('lookBtn').onclick = () => send(true);
 $('appBtn').onclick = () => api() && api().open_app();
@@ -438,8 +478,58 @@ $('insertBtn').onclick = async () => {
   if (!ok) $('hint').textContent = "Couldn't insert. Click where you want the text, then open me again.";
 };
 $('copyBtn').onclick = async () => { try { await navigator.clipboard.writeText(plain(reply)); $('hint').textContent = 'Copied!'; } catch (e) {} };
-$('newBtn').onclick = () => { chatId = null; reply = ''; out.classList.remove('show'); actions.classList.remove('show'); answer.innerHTML = ''; input.focus(); fit(); };
-window.quickOpened = (fresh = true) => { input.focus(); if (fresh) { input.select(); face('curious'); } fit(); };
+function clearView() {
+  reply = ''; out.classList.remove('show'); actions.classList.remove('show'); answer.innerHTML = '';
+  $('chatName').classList.remove('show');
+}
+$('newBtn').onclick = () => {
+  chatId = null; clearView(); input.focus(); fit();
+  fetch('/api/current', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"chat_id": null}' });
+};
+
+// stay in sync with the chat open in the app: show its latest answer and keep talking in it
+async function follow(id) {
+  if (busy) return;
+  if (!id) { if (chatId) { chatId = null; clearView(); fit(); } return; }
+  chatId = id;
+  try {
+    const [msgs, chats] = await Promise.all([fetch('/api/chats/' + id).then(r => r.json()), fetch('/api/chats').then(r => r.json())]);
+    const last = [...msgs].reverse().find(m => m.role === 'assistant');
+    const chat = chats.find(c => c.id === id);
+    $('chatName').textContent = chat ? 'in: ' + chat.title : ''; $('chatName').classList.toggle('show', !!chat);
+    if (last) { reply = last.content; answer.innerHTML = md(reply); out.classList.add('show'); actions.classList.add('show'); }
+    else { out.classList.remove('show'); actions.classList.remove('show'); }
+  } catch (e) {}
+  fit();
+}
+window.quickOpened = async (fresh = true) => {
+  input.focus();
+  if (fresh) {
+    input.select(); face('curious');
+    try { const cur = await fetch('/api/current').then(r => r.json()); if (cur.chat_id !== chatId) follow(cur.chat_id); } catch (e) {}
+    try { showCall((await fetch('/api/voice').then(r => r.json())).in_call); } catch (e) {}
+  }
+  fit();
+};
+
+// call button, shared with the app window
+let inCall = false;
+function showCall(on) { inCall = on; $('callBtn').classList.toggle('on', on); $('callBtn').title = on ? 'End the call' : 'Start a voice call'; }
+$('callBtn').onclick = async () => {
+  const r = await fetch('/api/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ action: inCall ? 'hangup' : 'call' }) }).then(r => r.json());
+  showCall(r.in_call);
+  if (r.voice === 'starting') status('connecting the call...');
+};
+
+// live updates from the app: replies in the current chat, call on/off, face states from a call
+const events = new EventSource('/events');
+events.onmessage = e => {
+  const d = JSON.parse(e.data);
+  if (d.event === 'chat' && d.current && !busy) follow(d.chat_id);
+  if (d.event === 'call') showCall(d.in_call);
+  if (d.state && !busy) face(d.state);
+};
 // clicking the bar after using another app: take keyboard focus back (Windows won't do it on its own here)
 document.addEventListener('mousedown', e => {
   if (!document.hasFocus() && api() && !e.target.closest('.pywebview-drag-region')) api().activate();

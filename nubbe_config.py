@@ -44,6 +44,9 @@ DEFAULTS = {
         "barge_in": True,
         "say": {"Erfan": "Er-fawn", "NUBB-E": "Noobee"},
     },
+    "tools": {
+        "workspace_dir": "workspace",
+    },
 }
 
 

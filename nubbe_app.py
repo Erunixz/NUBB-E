@@ -42,6 +42,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -73,6 +74,7 @@ DB_PATH = DATA_DIR / "nubbe.db"
 PROMPT_PATH = HERE / "nubbe_system_prompt.txt"
 from nubbe_face import FACE_JS, FACE_STATES   # shared face engine (keep nubbe_face.py next to this file)
 from nubbe_quick import QUICK_PAGE            # quick bar page (keep nubbe_quick.py next to this file)
+import nubbe_tools as tools                   # file tools, only inside workspace_dir (keep next to this file)
 
 VOICE_RULES = (
     "\n\n## Voice call\n"
@@ -91,11 +93,17 @@ VOICE_RULES = (
 EXTRACT_PROMPT = (
     "You maintain a small memory about the user, Erfan. From the exchange below, list NEW lasting "
     "facts the user stated about himself: preferences, projects, goals, setup, people in his life, "
-    "how he likes things done. Only facts the USER clearly said, never guesses or things the assistant said. "
+    "how he likes things done, and feedback about how NUBB-E should talk or behave (for example: wants "
+    "shorter answers). Only facts the USER clearly said, never guesses or things the assistant said. "
     "Skip temporary things (today's mood, a one-off question). Skip anything already known. "
     "Never save passwords, ID numbers, card or bank numbers. "
     "Write each fact as a short sentence, one per line, starting with '- '. "
     "If there is nothing new worth remembering, reply with exactly NONE."
+)
+
+SUMMARY_PROMPT = (
+    "Summarize this conversation between Erfan and NUBB-E in one or two short sentences: the topics, "
+    "any decisions, and anything to follow up on. Plain text, no lists, no preamble."
 )
 
 # ---------------------------------------------------------------------------
@@ -111,7 +119,13 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
 DEFAULT_SETTINGS = {"auto_memory": "1", "think": "0"}   # Fast by default: Smart thinks first, which is slow
 CHAT_SLOT, MEMORY_SLOT, LOOK_SLOT, VOICE_SLOT = 0, 1, 2, 3   # fixed brain slots, so each keeps its prompt cached
+LOOK_MEMORY_SECONDS = 600   # a screenshot stays in the conversation (in RAM only) for follow-up questions
+LAST_LOOK: dict[int, dict] = {}   # chat id -> {"image", "msg_id", "time"}; never written to disk
+CURRENT = {"chat_id": None}       # the chat open in the app, shared with the quick bar
 VISION = bool(CFG["brain"].get("mmproj"))
+MAX_TOOL_ROUNDS = 6         # tool calls per reply before NUBB-E has to answer
+CONFIRM_SECONDS = 300       # a Yes/No card with no answer counts as No
+PENDING: dict[str, dict] = {}   # confirmation card id -> {"event", "ok"}
 
 
 def take_screenshot(monitor: int = 1, width: int = 1280) -> str:
@@ -144,6 +158,10 @@ def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as con, con:
         con.executescript(SCHEMA)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(chats)")}
+        if "summary" not in cols:   # added later: a short running summary of each chat
+            con.execute("ALTER TABLE chats ADD COLUMN summary TEXT")
+            con.execute("ALTER TABLE chats ADD COLUMN summary_n INTEGER DEFAULT 0")
         con.execute("PRAGMA journal_mode = WAL")
         for k, v in DEFAULT_SETTINGS.items():
             con.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
@@ -252,7 +270,7 @@ class Brain:
             if proc.poll() is not None:
                 return
             time.sleep(0.5)
-        warm_slot(system_prompt(), CHAT_SLOT)
+        warm_slot(system_prompt(with_tools=True), CHAT_SLOT)
 
     def ensure(self, on_wait=None, timeout=600) -> bool:
         """Makes sure the brain is up, waking it if needed. Calls on_wait() once if we have to wait."""
@@ -324,12 +342,17 @@ class Brain:
 BRAIN = Brain(idle_minutes=CFG["brain"]["idle_unload_minutes"])
 
 
+def tool_list(slot: int):
+    """File tools are offered in text chats (not voice, which stays fast) when the workspace folder exists."""
+    return tools.SCHEMAS if slot == CHAT_SLOT and tools.root() else None
+
+
 def warm_slot(system: str, slot: int) -> None:
     """Sends a tiny hidden message so this slot has the system prompt cached (and the GPU is warm)."""
     try:
         with BRAIN.use():
             msgs = [{"role": "system", "content": system}, {"role": "user", "content": "hi"}]
-            for _ in llm_stream(msgs, think=False, max_tokens=1, slot=slot):
+            for _ in llm_stream(msgs, think=False, max_tokens=1, slot=slot, tools=tool_list(slot)):
                 pass
     except Exception:
         pass
@@ -398,7 +421,7 @@ class Voice:
 VOICE = Voice()
 
 
-def system_prompt() -> str:
+def system_prompt(chat_id=None, with_tools=False) -> str:
     if PROMPT_PATH.exists():
         base = PROMPT_PATH.read_text(encoding="utf-8")
     else:
@@ -408,12 +431,25 @@ def system_prompt() -> str:
         base += ("\n\n## What you remember about Erfan\n"
                  + "\n".join(f"- {m['text']}" for m in mems)
                  + "\nUse these naturally when they're relevant. Don't list them back unprompted.")
+    recent = rows("SELECT title, summary FROM chats WHERE summary IS NOT NULL AND summary != '' "
+                  "AND id != ? AND updated > ? ORDER BY updated DESC LIMIT 5",
+                  (chat_id or 0, time.time() - 14 * 86400))
+    if recent:   # what you talked about in other chats lately, so NUBB-E can connect the dots
+        base += ("\n\n## Recent conversations with Erfan (other chats)\n"
+                 + "\n".join(f"- {r['title']}: {r['summary']}" for r in recent)
+                 + "\nBring these up only when they're relevant, like a friend who remembers.")
+    if with_tools and tools.root():
+        base += tools.RULES.format(root=tools.root())
     return base
 
 
-def llm_stream(messages: list, think: bool, max_tokens=None, temperature=None, slot=CHAT_SLOT):
-    """Yields ('reasoning', '') while the model thinks and ('content', text) as it answers."""
+def llm_stream(messages: list, think: bool, max_tokens=None, temperature=None, slot=CHAT_SLOT, tools=None):
+    """Yields ('reasoning', '') while the model thinks and ('content', text) as it answers.
+    With tools, ends with ('tool_calls', [...]) if the model wants to use some."""
     payload = {"model": "local", "stream": True, "messages": messages, "id_slot": slot}
+    if tools:
+        payload["tools"] = tools
+    calls: dict[int, dict] = {}
     if not think:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     if max_tokens:
@@ -438,6 +474,16 @@ def llm_stream(messages: list, think: bool, max_tokens=None, temperature=None, s
                 yield "reasoning", ""
             if delta.get("content"):
                 yield "content", delta["content"]
+            for tc in delta.get("tool_calls") or []:   # streamed in pieces: name first, arguments bit by bit
+                c = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "arguments": ""})
+                c["id"] = tc.get("id") or c["id"]
+                fn = tc.get("function") or {}
+                c["name"] += fn.get("name") or ""
+                c["arguments"] += fn.get("arguments") or ""
+    if calls:
+        yield "tool_calls", [{"id": c["id"] or f"call_{i}", "type": "function",
+                              "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
+                             for i, c in sorted(calls.items())]
 
 
 _memory_lock = threading.Lock()
@@ -472,6 +518,33 @@ def extract_memories(user_text: str, reply: str) -> None:
                 added += 1
         if added:
             broadcast({"event": "memory"})
+
+
+def summarize_chat(chat_id: int) -> None:
+    """Keeps a one or two sentence summary of each chat, so other chats can refer back to it."""
+    with _memory_lock:
+        chat = rows("SELECT summary_n FROM chats WHERE id = ?", (chat_id,))
+        msgs = rows("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,))
+        if not chat or len(msgs) < 4 or len(msgs) - (chat[0]["summary_n"] or 0) < 4:
+            return   # refresh every two exchanges or so
+        talk = "\n".join(f"{'Erfan' if m['role'] == 'user' else 'NUBB-E'}: {m['content'][:400]}" for m in msgs[-30:])
+        try:
+            with BRAIN.use():
+                out = "".join(v for k, v in llm_stream(
+                    [{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": talk}],
+                    think=False, max_tokens=90, temperature=0.2, slot=MEMORY_SLOT) if k == "content")
+        except Exception:
+            return
+        out = " ".join(out.split())[:400]
+        if out:
+            run("UPDATE chats SET summary = ?, summary_n = ? WHERE id = ?", (out, len(msgs), chat_id))
+
+
+def learn_from(chat_id: int, text: str, reply: str, memory: bool) -> None:
+    """After each reply, in the background: remember new facts, refresh this chat's summary."""
+    if memory:
+        extract_memories(text, reply)
+    summarize_chat(chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +639,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(rows("SELECT id, text, source FROM memories ORDER BY id DESC"))
         elif path == "/api/settings":
             self.send_json(get_settings())
+        elif path == "/api/current":
+            self.send_json(CURRENT)
+        elif path == "/api/voice":
+            self.send_json({"in_call": VOICE.in_call})
         else:
             self.send_error(404)
 
@@ -587,13 +664,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400)
                 return
             self.send_json({"voice": VOICE.send(action), "in_call": VOICE.in_call})
+            broadcast({"event": "call", "in_call": VOICE.in_call})   # app window and quick bar buttons
+        elif path == "/api/current":      # the app window opened a chat (or a new one)
+            cid = body.get("chat_id")
+            CURRENT["chat_id"] = int(cid) if cid else None
+            self.send_json(CURRENT)
         elif path == "/api/look":
             self.chat(body, look=True)
+        elif path == "/api/confirm":     # Erfan pressed Yes or No on a tool card
+            card = PENDING.get(str(body.get("id", "")))
+            if card:
+                card["ok"] = body.get("ok") is True
+                card["event"].set()
+            self.send_json({"ok": bool(card)})
         elif path == "/state":  # set_face() from other scripts
             if body.get("state") not in FACE_STATES:
                 self.send_error(400)
                 return
             broadcast(body)
+            if body.get("text") in ("Call ended", "Can't open the mic.") and VOICE.in_call:
+                VOICE.in_call = False
+                broadcast({"event": "call", "in_call": False})
             self.send_response(204)
             self.end_headers()
         elif m := re.fullmatch(r"/api/chats/(\d+)/delete", path):
@@ -666,14 +757,30 @@ class Handler(BaseHTTPRequestHandler):
                      else "Quick: " if body.get("source") == "quick"
                      else "Look: " if look else "") + title_from(text)
             chat_id = run("INSERT INTO chats(title, created, updated) VALUES (?, ?, ?)", (title, now, now))
-        run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'user', ?, ?)",
-            (chat_id, saved_text, now))
-        history = rows("SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,))[-HISTORY_TURNS:]
+        msg_id = run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'user', ?, ?)",
+                     (chat_id, saved_text, now))
+        if not voice:
+            CURRENT["chat_id"] = chat_id          # the app window and the quick bar follow this chat
         if image:
-            history[-1] = {"role": "user", "content": [
-                {"type": "text", "text": f"(This image is a screenshot of my screen right now, taken by your Look button.) {text}"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}}]}
-        messages = [{"role": "system", "content": system_prompt() + (VOICE_RULES if voice else "")}] + history
+            LAST_LOOK[chat_id] = {"image": image, "msg_id": msg_id, "time": now}
+        for cid in [c for c, v in LAST_LOOK.items() if now - v["time"] > LOOK_MEMORY_SECONDS]:
+            del LAST_LOOK[cid]
+        history = rows("SELECT id, role, content FROM messages WHERE chat_id = ? ORDER BY id",
+                       (chat_id,))[-HISTORY_TURNS:]
+        shot = LAST_LOOK.get(chat_id)
+        for h in history:
+            if shot and h["id"] == shot["msg_id"]:   # the screenshot rides along for follow-up questions
+                asked = h["content"].removeprefix("[screenshot] ")
+                h["content"] = [
+                    {"type": "text", "text": "(I'm sharing a screenshot of my screen so you can see what I mean. "
+                                             "Use it as context to answer what I asked. Only describe the screen "
+                                             f"if I ask what's on it.) {asked}"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{shot['image']}"}}]
+            del h["id"]
+        slot = VOICE_SLOT if voice else CHAT_SLOT
+        offered = tool_list(slot)
+        messages = [{"role": "system", "content": system_prompt(chat_id, with_tools=bool(offered))
+                     + (VOICE_RULES if voice else "")}] + history
         settings = get_settings()
         think = False if voice else settings["think"]
 
@@ -693,15 +800,28 @@ class Handler(BaseHTTPRequestHandler):
                         if BRAIN.can_start else
                         "My brain isn't running. Start llama-server, or start me without --no-brain.")})
                     return
-                for kind, val in llm_stream(messages, think=think, max_tokens=120 if voice else None,
-                                            slot=LOOK_SLOT if look else VOICE_SLOT if voice else CHAT_SLOT):
-                    if kind == "reasoning":
-                        if not told_reasoning:
-                            self.emit({"type": "reasoning"})
-                            told_reasoning = True
-                    else:
-                        reply += val
-                        self.emit({"type": "delta", "text": val})
+                for rnd in range(MAX_TOOL_ROUNDS + 1):   # the last round has no tools, so it must answer
+                    calls, said = [], ""
+                    for kind, val in llm_stream(messages, think=think, max_tokens=120 if voice else None,
+                                                slot=slot, tools=offered if rnd < MAX_TOOL_ROUNDS else None):
+                        if kind == "reasoning":
+                            if not told_reasoning:
+                                self.emit({"type": "reasoning"})
+                                told_reasoning = True
+                        elif kind == "tool_calls":
+                            calls = val
+                        else:
+                            if not said and reply and not reply.endswith("\n"):
+                                val = "\n\n" + val          # text before and after a tool call
+                            said += val
+                            reply += val
+                            self.emit({"type": "delta", "text": val})
+                    if not calls:
+                        break
+                    messages.append({"role": "assistant", "content": said, "tool_calls": calls})
+                    for c in calls:
+                        messages.append({"role": "tool", "tool_call_id": c["id"], "content": self.use_tool(c)})
+                    told_reasoning = False
                 self.emit({"type": "done"})
         except urllib.error.HTTPError as e:
             self.safe_emit({"type": "error", "text": f"My brain had trouble with that one (error {e.code}). Try again?"})
@@ -720,10 +840,38 @@ class Handler(BaseHTTPRequestHandler):
                     run("UPDATE chats SET updated = ? WHERE id = ?", (time.time(), chat_id))
                 except sqlite3.Error as e:
                     print(f"Couldn't save the reply: {e}")
-                if voice or look:
-                    broadcast({"event": "chat", "chat_id": chat_id})   # window shows voice / look chats live
-                if settings["auto_memory"] and not look:   # screen contents aren't facts about Erfan
-                    threading.Thread(target=extract_memories, args=(text, reply), daemon=True).start()
+                # the app window and the quick bar both show this chat live
+                broadcast({"event": "chat", "chat_id": chat_id, "current": CURRENT["chat_id"] == chat_id})
+                # screen contents aren't facts about Erfan, so looks don't feed the memory
+                threading.Thread(target=learn_from, args=(chat_id, text, reply, settings["auto_memory"] and not look),
+                                 daemon=True).start()
+
+    def use_tool(self, c: dict) -> str:
+        """Runs one tool call from the model. Anything that changes files or runs a command waits for
+        Erfan's Yes on a card in the chat; no answer, a closed window or a timeout all count as No."""
+        name = c["function"]["name"]
+        try:
+            args = json.loads(c["function"]["arguments"] or "{}")
+            if not isinstance(args, dict):
+                raise ValueError
+        except ValueError:
+            tools.log(DATA_DIR / "tools.log", name, {}, "error: arguments weren't valid JSON")
+            return "Your tool arguments weren't valid JSON. Try again."
+        line = tools.status(name, args)
+        self.emit({"type": "tool", "name": name, "text": line})
+        broadcast({"state": "thinking", "status": line[:60]})
+        approved = None
+        if tools.needs_yes(name) and name in tools.TOOLS:
+            cid = secrets.token_hex(16)
+            PENDING[cid] = {"event": threading.Event(), "ok": False}
+            try:
+                self.emit({"type": "confirm", "id": cid, **tools.card(name, args)})
+                PENDING[cid]["event"].wait(CONFIRM_SECONDS)
+                approved = PENDING[cid]["ok"]
+            finally:
+                del PENDING[cid]
+            self.emit({"type": "confirmed", "id": cid, "ok": approved})
+        return tools.call(name, args, DATA_DIR / "tools.log", approved)
 
     def safe_emit(self, obj):
         try:
@@ -910,6 +1058,19 @@ PAGE = r"""<!doctype html>
   .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
   .msg.note { align-self: center; color: var(--muted); font-size: 13px; padding: 4px; }
   .msg .thinking { color: var(--muted); font-style: italic; }
+  .tool-line { align-self: flex-start; color: var(--muted); font-size: 12px; padding: 0 6px; }
+  .tool-line::before { content: "\2192  "; color: var(--glow); }
+  .tool-card { align-self: flex-start; max-width: 80%; background: var(--panel); border: 1px solid var(--glow);
+               border-radius: 12px; padding: 10px 14px; font-size: 14px; }
+  .tool-card .target { color: var(--muted); }
+  .tool-card pre { max-height: 220px; overflow: auto; background: var(--bg); padding: 8px 10px; border-radius: 8px;
+                   white-space: pre-wrap; word-break: break-word; margin: 8px 0; }
+  .tool-btns { display: flex; gap: 8px; align-items: center; }
+  .tool-btns button { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); color: var(--text); }
+  .tool-btns .yes { border-color: var(--glow); color: var(--glow); }
+  .tool-btns button:disabled { opacity: .4; cursor: default; }
+  .tool-btns .answer { color: var(--muted); font-size: 13px; }
+  .tool-card.done { border-color: var(--line); }
   .msg pre { background: #070a0e; padding: 10px; border-radius: 8px; overflow-x: auto; }
   .msg code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
   .msg :not(pre) > code { background: #070a0e; padding: 1px 5px; border-radius: 4px; }
@@ -1057,13 +1218,14 @@ async function loadChats() {
 }
 async function openChat(id) {
   if (busy) return;
+  if (chatId !== id) api('/api/current', { chat_id: id });   // the quick bar follows the open chat
   chatId = id; msgs.innerHTML = '';
   const history = await api('/api/chats/' + id);
   history.forEach(m => bubble(m.role, m.content));
   if (!history.length) showEmpty();
   loadChats(); input.focus();
 }
-function newChat() { if (busy) return; chatId = null; showEmpty(); loadChats(); setFace('happy', 1200); input.focus(); }
+function newChat() { if (busy) return; chatId = null; api('/api/current', { chat_id: null }); showEmpty(); loadChats(); setFace('happy', 1200); input.focus(); }
 
 async function send(text, look = false) {
   if (!look && text.startsWith('/remember ')) {
@@ -1098,6 +1260,9 @@ async function send(text, look = false) {
         else if (ev.type === 'reasoning') { setFace('thinking'); out.innerHTML = '<span class="thinking">thinking...</span>'; }
         else if (ev.type === 'delta') { reply += ev.text; setFace('talking'); if (!pending) { pending = true; requestAnimationFrame(render); } }
         else if (ev.type === 'error') { out.innerHTML = '<span class="thinking">' + esc(ev.text) + '</span>'; }
+        else if (ev.type === 'tool') { toolLine(out, ev.text); setFace('thinking'); if (!reply) out.innerHTML = '<span class="thinking">...</span>'; }
+        else if (ev.type === 'confirm') { confirmCard(out, ev); setFace('curious'); }
+        else if (ev.type === 'confirmed') settleCard(ev.id, ev.ok);
       }
     }
     if (reply) render();   // keeps an error message visible when there's no reply
@@ -1108,6 +1273,31 @@ async function send(text, look = false) {
   const replyMood = reactToReply(reply);
   if (replyMood) setFace(replyMood);
   busy = false; sendBtn.disabled = false; $('lookBtn').disabled = false; loadChats(); input.focus();
+}
+
+// file tools: a small line for each step, and a Yes/No card before anything changes (No is the default)
+function toolLine(out, text) {
+  const el = document.createElement('div'); el.className = 'tool-line'; el.textContent = text;
+  msgs.insertBefore(el, out); msgs.scrollTop = msgs.scrollHeight;
+}
+function confirmCard(out, ev) {
+  const el = document.createElement('div'); el.className = 'tool-card'; el.id = 'card-' + ev.id;
+  el.innerHTML = '<b></b> <span class="target"></span><pre></pre>'
+    + '<div class="tool-btns"><button class="no">No</button><button class="yes">Yes, do it</button><span class="answer"></span></div>';
+  el.querySelector('b').textContent = ev.title + ':';
+  el.querySelector('.target').textContent = ev.target;
+  el.querySelector('pre').textContent = ev.detail;
+  const answer = ok => { api('/api/confirm', { id: ev.id, ok }); settleCard(ev.id, ok); };
+  el.querySelector('.no').onclick = () => answer(false);
+  el.querySelector('.yes').onclick = () => answer(true);
+  msgs.insertBefore(el, out); msgs.scrollTop = msgs.scrollHeight;
+  el.querySelector('.no').focus();
+}
+function settleCard(id, ok) {
+  const el = $('card-' + id); if (!el || el.classList.contains('done')) return;
+  el.classList.add('done'); el.querySelectorAll('button').forEach(b => b.disabled = true);
+  el.querySelector('.answer').textContent = ok ? 'You said Yes.' : 'Not done.';
+  input.focus();
 }
 
 // call button: a hands-free voice call. The voice helper reports listening / thinking / talking
@@ -1193,13 +1383,17 @@ const es = new EventSource('/events');
 es.onmessage = e => {
   const d = JSON.parse(e.data);
   if (d.event === 'memory' && $('memPanel').classList.contains('open')) loadMemory();
-  if (d.event === 'chat' && !busy) { if (chatId === d.chat_id) openChat(d.chat_id); else loadChats(); }
+  // a reply finished somewhere (here, the quick bar, or a call): show it if it's the chat we're on,
+  // or switch to it when the quick bar continued the current chat
+  if (d.event === 'chat' && !busy) { if (chatId === d.chat_id || d.current) openChat(d.chat_id); else loadChats(); }
+  if (d.event === 'call') showCall(d.in_call);
   if (d.state && !busy) { setFace(d.state); if (d.status) faceStatus.textContent = d.status; }
   if (d.state) showMic(d.state, d.status);
 };
 
 (async () => {
   settings = await api('/api/settings'); showMode();
+  showCall((await api('/api/voice')).in_call);
   showEmpty(); loadChats(); checkBrain(); setInterval(checkBrain, 3000); input.focus();
 })();
 </script>
