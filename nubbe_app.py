@@ -439,7 +439,7 @@ def system_prompt(chat_id=None, with_tools=False) -> str:
                  + "\n".join(f"- {r['title']}: {r['summary']}" for r in recent)
                  + "\nBring these up only when they're relevant, like a friend who remembers.")
     if with_tools and tools.root():
-        base += tools.RULES.format(root=tools.root())
+        base += tools.rules()
     return base
 
 

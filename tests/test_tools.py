@@ -244,3 +244,80 @@ def test_no_tools_in_voice_or_without_a_workspace(base, fake, ws, monkeypatch):
     monkeypatch.setattr(tools, "WORKSPACE_DIR", "")
     chat_answering(base, "Hi")
     assert "tools" not in chat_requests(fake)[-1]
+
+
+# ---------------------------------------------------------------------------
+# whole-laptop mode (workspace_dir = "*"): read anywhere, change only after Yes, secrets never
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def laptop(tmp_path, data_dir, monkeypatch):
+    """"*" mode with a temp home folder that has notes and a few secret places."""
+    home = tmp_path / "home"
+    (home / "Documents").mkdir(parents=True)
+    (home / "Documents" / "plans.md").write_text("Robot arm plan: stronger servo.\n", encoding="utf-8")
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "id_rsa").write_text("PRIVATE KEY servo", encoding="utf-8")
+    chrome = home / "AppData" / "Local" / "Google" / "Chrome" / "User Data" / "Default"
+    chrome.mkdir(parents=True)
+    (chrome / "Login Data").write_text("saved password servo", encoding="utf-8")
+    (home / "AppData" / "Local" / "SomeApp").mkdir(parents=True)
+    (home / "AppData" / "Local" / "SomeApp" / "settings.ini").write_text("servo=on\n", encoding="utf-8")
+    (home / "Documents" / "vault.kdbx").write_text("servo", encoding="utf-8")
+    (home / "Documents" / ".env").write_text("TOKEN=servo", encoding="utf-8")
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(tools, "WORKSPACE_DIR", "*")
+    return home.resolve()
+
+
+def test_laptop_mode_reads_anywhere(laptop, tmp_path):
+    assert tools.root() == laptop and any(laptop.is_relative_to(r) for r in tools.roots())
+    assert tools.read_file("Documents/plans.md").startswith("Robot arm plan")      # relative: from home
+    assert tools.read_file("~/Documents/plans.md").startswith("Robot arm plan")
+    (tmp_path / "elsewhere.txt").write_text("other folder", encoding="utf-8")
+    assert tools.read_file(str(tmp_path / "elsewhere.txt")) == "other folder"       # outside home is fine too
+    assert tools.show(laptop / "Documents" / "plans.md") == "~/Documents/plans.md"
+    assert "whole home folder" in tools.rules() and str(laptop) in tools.rules()
+
+
+def test_laptop_mode_never_opens_secrets(laptop):
+    for p in ("~/.ssh/id_rsa", "~/.ssh", "AppData/Local/Google/Chrome/User Data/Default/Login Data",
+              "Documents/vault.kdbx", "Documents/.env", "~/.nubbe/nubbe.db"):
+        with pytest.raises(tools.ToolError, match="private"):
+            tools.read_file(p)
+    assert ".ssh" not in tools.list_dir("~") and "vault.kdbx" not in tools.list_dir("Documents")
+    out = tools.search_files("servo")
+    assert out.startswith("~/Documents/plans.md")
+    assert "id_rsa" not in out and "Login Data" not in out and "vault" not in out and ".env" not in out
+    assert "settings.ini" not in out                                     # AppData is skipped on the way down...
+    assert "settings.ini" in tools.search_files("servo", "~/AppData/Local/SomeApp")   # ...but searchable directly
+
+
+def test_laptop_mode_search_stops_in_time(laptop, monkeypatch):
+    monkeypatch.setattr(tools, "SEARCH_SECONDS", -1)
+    assert "stopped early" in tools.search_files("servo")
+
+
+def test_laptop_mode_writes_still_need_yes(base, fake, laptop):
+    fake.plan = [("write_file", {"path": "~/Documents/plans.md", "content": "gone"})]
+    chat_answering(base, "Wipe my plans", answer=False)
+    assert (laptop / "Documents" / "plans.md").read_text(encoding="utf-8").startswith("Robot arm plan")
+    fake.plan = [("write_file", {"path": "~/Documents/new.md", "content": "hi"})]
+    events = chat_answering(base, "Make a note", answer=True)
+    assert next(e for e in events if e["type"] == "confirm")["target"] == "~/Documents/new.md (new file)"
+    assert (laptop / "Documents" / "new.md").read_text(encoding="utf-8") == "hi"
+    fake.plan = [("write_file", {"path": "~/.ssh/authorized_keys", "content": "x"})]
+    chat_answering(base, "Add a key", answer=True)
+    assert not (laptop / ".ssh" / "authorized_keys").exists()          # private places can't be written, even with Yes
+
+
+def test_online_only_cloud_files_are_never_downloaded(ws, monkeypatch):
+    opened = []
+    real_text = tools._text
+    monkeypatch.setattr(tools, "cloud_only", lambda st: st.st_size == (ws / "todo.txt").stat().st_size)
+    monkeypatch.setattr(tools, "_text", lambda p, limit: opened.append(p.name) or real_text(p, limit))
+    with pytest.raises(tools.ToolError, match="online-only"):
+        tools.read_file("todo.txt")
+    assert "todo.txt" in tools.search_files("todo")            # its name still matches...
+    assert "todo.txt" not in opened                            # ...but it was never opened
+    assert tools.cloud_only(os.stat_result((0,) * 10)) is False

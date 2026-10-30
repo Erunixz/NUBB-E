@@ -60,7 +60,8 @@ barge_in = true               # talk over NUBB-E to interrupt it (it pauses, and
 "NUBB-E" = "Noobee"
 
 [tools]
-# The one folder NUBB-E's file tools can use: read, search, and (only after you press Yes)
-# write files or run commands. Anything outside it is refused. "" turns the tools off.
-# Relative paths are inside this project; "~/Documents/Notes" style paths work too.
-workspace_dir = "workspace"
+# Where NUBB-E's file tools work. "*" = the whole laptop (every drive).
+# Reading, listing and searching need no approval. Writing a file or running a command
+# always shows a Yes/No card first. Keys, saved passwords and browser data are never opened.
+# Or set one folder, like "~/Documents/Notes", to keep it to that. "" turns the tools off.
+workspace_dir = "*"

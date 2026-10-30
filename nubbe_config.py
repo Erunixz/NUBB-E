@@ -45,7 +45,7 @@ DEFAULTS = {
         "say": {"Erfan": "Er-fawn", "NUBB-E": "Noobee"},
     },
     "tools": {
-        "workspace_dir": "workspace",
+        "workspace_dir": "*",
     },
 }
 

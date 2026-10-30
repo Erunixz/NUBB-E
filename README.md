@@ -6,14 +6,16 @@ The full setup guide comes later. For now, this covers files and voice.
 
 ## Files
 
-NUBB-E can read and search the files in one folder: `workspace_dir` in `config.toml` (by default the `workspace` folder here, which stays off GitHub). Point it at your notes, for example `workspace_dir = "~/Documents/Notes"`, and ask things like "what's in my notes about the robot arm?".
+NUBB-E can look at the files on your laptop and answer from them: "what's in my notes about the robot arm?", "what does my config file in ~/Documents/project say?".
 
-- **Looking is free:** listing, reading and searching happen right away.
+- **Reading is free:** listing, reading and searching any folder happen right away, no questions asked.
 - **Changing needs your Yes:** before NUBB-E writes a file or runs a command, a card shows the exact file and text, or the exact command. Nothing happens until you press **Yes**. No, closing the window, or 5 minutes with no answer all mean no.
-- **One folder only:** paths outside it are refused, including `..` tricks and links that point outside.
+- **Private stuff is off limits:** SSH keys, saved browser passwords and cookies, Windows credentials, password vaults (`.kdbx`), `.env` files and NUBB-E's own data are never opened, even with Yes.
+- **Cloud files stay in the cloud:** OneDrive "online-only" files aren't downloaded. NUBB-E only matches their names.
+- **Search is fastest in one folder,** like `~/Documents`. A search stops after 15 seconds and says so.
 - **Everything is logged** in `~/.nubbe/tools.log` (file names and commands, not your file contents).
 
-File tools work in the app and the quick bar. Voice calls skip them to stay fast. Set `workspace_dir = ""` to turn them off.
+This is `workspace_dir = "*"` in `config.toml`. To keep NUBB-E to one folder instead, set something like `workspace_dir = "~/Documents/Notes"`. `""` turns the file tools off. They work in the app and the quick bar. Voice calls skip them to stay fast.
 
 ## Voice
 

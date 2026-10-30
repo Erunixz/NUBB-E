@@ -1,4 +1,4 @@
-"""NUBB-E's file tools: they only work inside one folder (workspace_dir in config.toml).
+"""NUBB-E's file tools: they only work inside workspace_dir (config.toml): one folder, or "*".
 
     import nubbe_tools as tools
     tools.SCHEMAS                       # OpenAI-style tool list for llama-server (--jinja)
@@ -6,11 +6,15 @@
     tools.card("write_file", args)      # what that card says
     tools.call("read_file", {"path": "notes.md"}, log_file)   # -> text for the model
 
+workspace_dir = "*" means the whole laptop: every drive can be read, but
+keys, saved passwords and browser data are always refused.
+
 Read-only tools: list_dir, read_file, search_files.
 Tools that change things: write_file, run_command. The app never runs these
 without Erfan pressing Yes. Every call is logged to ~/.nubbe/tools.log
 (the app passes the path). Standard library only.
 """
+import functools
 import json
 import os
 import subprocess
@@ -41,67 +45,150 @@ def _tool(name, description, props, required):
         "type": "object", "properties": props, "required": required}}}
 
 
-_PATH = {"type": "string", "description": "Path relative to the workspace folder, like 'notes/ideas.md'. '.' is the folder itself."}
+_PATH = {"type": "string", "description": "A full path like 'C:/Users/me/notes.md' or '~/Documents/notes.md', "
+         "or a path relative to the starting folder, like 'notes/ideas.md'. '.' is the starting folder itself."}
 SCHEMAS = [
-    _tool("list_dir", "List the files and folders in a folder of Erfan's workspace.", {"path": _PATH}, []),
-    _tool("read_file", "Read a text file from Erfan's workspace.", {"path": _PATH}, ["path"]),
-    _tool("search_files", "Search the text files in Erfan's workspace for keywords (case doesn't matter). "
+    _tool("list_dir", "List the files and folders in a folder on Erfan's computer.", {"path": _PATH}, []),
+    _tool("read_file", "Read a text file from Erfan's computer.", {"path": _PATH}, ["path"]),
+    _tool("search_files", "Search the text files in a folder for keywords (case doesn't matter). "
           "Returns matching files with line numbers. Use it to find notes about a topic.",
           {"query": {"type": "string", "description": "One or a few keywords, like 'robot arm'."},
-           "path": {**_PATH, "description": "Folder to search in (default: the whole workspace)."}}, ["query"]),
-    _tool("write_file", "Create or overwrite a text file in Erfan's workspace. Erfan sees the exact change "
+           "path": {**_PATH, "description": "Folder to search in (default: the starting folder)."}}, ["query"]),
+    _tool("write_file", "Create or overwrite a text file. Erfan sees the exact change "
           "and must press Yes first.",
           {"path": _PATH, "content": {"type": "string", "description": "The full new text of the file."}},
           ["path", "content"]),
-    _tool("run_command", "Run a shell command in Erfan's workspace folder"
+    _tool("run_command", "Run a shell command in the starting folder"
           f" ({'Windows cmd' if sys.platform == 'win32' else 'sh'}). Erfan sees the exact command and must "
           f"press Yes first. Stops after {COMMAND_TIMEOUT} seconds.",
           {"command": {"type": "string", "description": "The exact command line."}}, ["command"]),
 ]
 
-RULES = (
+FOLDER_RULES = (
     "\n\n## Your file tools\n"
     "You can use tools on Erfan's workspace folder ({root}): list_dir, read_file and search_files to look, "
     "write_file and run_command to change things. Only that folder works. "
+)
+LAPTOP_RULES = (
+    "\n\n## Your file tools\n"
+    "You can look at any file on Erfan's laptop with list_dir, read_file and search_files, no need to ask. "
+    "Use full paths like 'C:/Users/...' or '~/Documents/...'; relative paths start in his home folder ({root}). "
+    "Searching is much faster in one folder (like ~/Documents or ~/Desktop) than the whole home folder. "
+    "write_file and run_command change things. "
+)
+RULES_END = (
     "When he asks about his notes or files, search or read them first, then answer from what's really there "
     "and say which file it came from. Never guess what a file says. If a tool refuses a path, just tell him "
-    "it's outside the workspace, without describing what that file probably contains. "
+    "why, without describing what that file probably contains. "
     "For write_file and run_command, the app shows Erfan a Yes/No card with the exact action, so just call "
     "the tool instead of asking in text. If he says No, don't try again unless he asks."
 )
+
+EVERYWHERE = "*"   # workspace_dir = "*": the whole laptop (every drive); reading is free, changes need Yes
+# Never opened, even in "*" mode: keys, saved passwords, browser data, Windows credentials, NUBB-E's own data.
+# Reading one would put a secret into a saved chat.
+SECRET_DIRS = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".nubbe",
+               "AppData/Roaming/Microsoft/Credentials", "AppData/Local/Microsoft/Credentials",
+               "AppData/Roaming/Microsoft/Protect", "AppData/Roaming/Microsoft/Crypto",
+               "AppData/Local/Google/Chrome/User Data", "AppData/Local/Microsoft/Edge/User Data",
+               "AppData/Local/BraveSoftware", "AppData/Roaming/Mozilla/Firefox/Profiles",
+               "AppData/Roaming/Opera Software", "AppData/Roaming/Bitwarden", "AppData/Roaming/1Password",
+               "AppData/Local/1Password"]
+SECRET_NAMES = {".env", ".netrc", ".git-credentials", ".pgpass", ".npmrc", ".pypirc", "id_rsa", "id_ed25519",
+                "id_ecdsa", "login data", "cookies", "web data", "key4.db", "logins.json", "sam", "security"}
+SECRET_SUFFIXES = (".kdbx", ".pem", ".key", ".pfx", ".p12", ".ppk", ".keychain")
+# big system folders a search skips on the way down (you can still search inside them directly)
+SEARCH_SKIP = {"windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
+               "system volume information", "recovery", "$windows.~ws", "$winreagent", "msocache"}
+BINARY_EXT = {".exe", ".dll", ".sys", ".bin", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".ico", ".mp3",
+              ".wav", ".mp4", ".mkv", ".mov", ".avi", ".zip", ".7z", ".rar", ".gz", ".tar", ".iso", ".gguf",
+              ".safetensors", ".onnx", ".pt", ".pdf", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".pyc"}
+SEARCH_SECONDS = 15
+MAX_SCAN = 50_000
+
+
+def rules() -> str:
+    return (LAPTOP_RULES if WORKSPACE_DIR == EVERYWHERE else FOLDER_RULES).format(root=root()) + RULES_END
 
 
 def needs_yes(name: str) -> bool:
     return name not in READ_ONLY
 
 
-def root() -> Path | None:
-    """The workspace folder, or None when the tools are off (not set, or the folder doesn't exist)."""
+def roots() -> list[Path]:
+    """Every folder the tools may use: one workspace folder, or every drive in "*" mode."""
     if not WORKSPACE_DIR:
-        return None
+        return []
+    if WORKSPACE_DIR == EVERYWHERE:
+        drives = os.listdrives() if hasattr(os, "listdrives") else ["/"]
+        return [Path(d) for d in drives if Path(d).is_dir()]
     p = Path(os.path.expanduser(WORKSPACE_DIR))
     if not p.is_absolute():
         p = Path(__file__).resolve().parent / p
     p = p.resolve()
-    return p if p.is_dir() else None
+    return [p] if p.is_dir() else []
+
+
+def root() -> Path | None:
+    """Where relative paths start (the home folder in "*" mode), or None when the tools are off."""
+    if not roots():
+        return None
+    return Path.home().resolve() if WORKSPACE_DIR == EVERYWHERE else roots()[0]
+
+
+def _under(p, folders) -> bool:
+    """Plain string checks: pathlib's is_relative_to is far too slow for a search over thousands of files."""
+    s = os.path.normcase(str(p))
+    return any(s == f or s.startswith(f.rstrip(os.sep) + os.sep) for f in folders)
+
+
+@functools.lru_cache(maxsize=4)
+def _secret_dirs(home: str) -> tuple:
+    return tuple(os.path.normcase(os.path.join(home, d.replace("/", os.sep))) for d in SECRET_DIRS)
+
+
+def secret(p: Path) -> bool:
+    if p.name.lower() in SECRET_NAMES or p.suffix.lower() in SECRET_SUFFIXES:
+        return True
+    return _under(p, _secret_dirs(os.path.expanduser("~")))
+
+
+def allowed(p: Path) -> bool:
+    return _under(p, [os.path.normcase(str(r)) for r in roots()]) and not secret(p)
 
 
 def inside(rel) -> Path:
-    """Resolves a path the model gave (following symlinks and '..') and refuses anything outside the workspace."""
+    """Resolves a path the model gave (following symlinks and '..') and refuses anything outside the
+    workspace, or private files like keys and saved passwords."""
     base = root()
     if base is None:
         raise ToolError("No workspace folder is set up (workspace_dir in config.toml).")
-    rel = str(rel or ".").strip() or "."
-    target = (base / rel).resolve()     # an absolute path replaces base, then fails the check below
-    if target != base and not target.is_relative_to(base):
+    rel = os.path.expanduser(str(rel or ".").strip() or ".")
+    target = (base / rel).resolve()     # an absolute path replaces base, then gets checked below
+    if not any(target.is_relative_to(r) for r in roots()):
         raise ToolError(f"'{rel}' is outside the workspace folder, so I can't touch it.")
+    if secret(target):
+        raise ToolError(f"'{rel}' is private (keys, passwords or browser data), so I don't open it.")
     return target
 
 
 def show(p: Path) -> str:
-    """A path as Erfan would write it, relative to the workspace."""
-    rel = p.relative_to(root()).as_posix()
+    """A path as Erfan would write it: relative to the workspace, or ~/... in "*" mode."""
+    base = root()
+    if not p.is_relative_to(base):
+        return p.as_posix()
+    rel = p.relative_to(base).as_posix()
+    if WORKSPACE_DIR == EVERYWHERE:
+        return "~" if rel == "." else "~/" + rel
     return rel if rel != "." else "(workspace)"
+
+
+# OneDrive-style "online-only" files: opening one makes Windows download it (slow, and it goes online)
+CLOUD_ONLY = 0x1000 | 0x40000 | 0x400000   # OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS
+
+
+def cloud_only(st: os.stat_result) -> bool:
+    return bool(getattr(st, "st_file_attributes", 0) & CLOUD_ONLY)
 
 
 def _text(p: Path, limit: int) -> str | None:
@@ -123,10 +210,11 @@ def list_dir(path=".") -> str:
     items = []
     for e in sorted(d.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
         try:
-            e.resolve().relative_to(root())   # skip links that point outside
-        except (ValueError, OSError):
+            if not allowed(e.resolve()):   # skip links that point outside, and private files
+                continue
+            items.append(e.name + "/" if e.is_dir() else f"{e.name}  ({e.stat().st_size:,} bytes)")
+        except OSError:
             continue
-        items.append(e.name + "/" if e.is_dir() else f"{e.name}  ({e.stat().st_size:,} bytes)")
     if not items:
         return f"{show(d)} is empty."
     more = f"\n... and {len(items) - 200} more" if len(items) > 200 else ""
@@ -137,6 +225,9 @@ def read_file(path) -> str:
     p = inside(path)
     if not p.is_file():
         raise ToolError(f"'{path}' doesn't exist." if not p.exists() else f"'{path}' is a folder, not a file.")
+    if cloud_only(p.stat()):
+        raise ToolError(f"'{path}' is an online-only cloud file, so it isn't on this laptop yet. "
+                        "Open it once (or pick 'Always keep on this device') and I can read it.")
     text = _text(p, MAX_READ_CHARS)
     if text is None:
         raise ToolError(f"'{path}' isn't a text file, so I can't read it.")
@@ -152,20 +243,33 @@ def search_files(query, path=".") -> str:
     start = inside(path)
     if not start.is_dir():
         raise ToolError(f"'{path}' isn't a folder.")
-    found, scanned = [], 0
+    found, scanned, stopped = [], 0, False
+    deadline = time.time() + SEARCH_SECONDS
     for folder, dirs, files in os.walk(start):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+        here = Path(folder)
+        if not allowed(here.resolve()):   # a link or junction out of the workspace
+            dirs[:] = []
+            continue
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")
+                         and d.lower() not in SEARCH_SKIP and not secret(here / d))
         for name in sorted(files):
-            p = Path(folder) / name
             scanned += 1
-            if scanned > 5000:
+            if scanned > MAX_SCAN or time.time() > deadline:
+                stopped = True
                 break
-            try:
-                if not p.resolve().is_relative_to(root()) or p.stat().st_size > MAX_SEARCH_FILE:
-                    continue
-                text = _text(p, MAX_SEARCH_FILE)
-            except OSError:
+            p = here / name
+            if secret(p):
                 continue
+            text = None
+            if p.suffix.lower() not in BINARY_EXT:
+                try:
+                    if p.is_symlink() and not allowed(p.resolve()):
+                        continue
+                    st = p.stat()
+                    if st.st_size <= MAX_SEARCH_FILE and not cloud_only(st):   # cloud files: name match only
+                        text = _text(p, MAX_SEARCH_FILE)
+                except OSError:
+                    continue
             hits = [w for w in words if w in name.lower()]
             lines = []
             if text:
@@ -178,12 +282,16 @@ def search_files(query, path=".") -> str:
                             break
             if hits:
                 found.append((len(set(hits)), show(p), lines))
+        if stopped:
+            break
+    note = (f"\n\n[stopped early after {scanned - 1:,} files: search a smaller folder to look further]"
+            if stopped else "")
     if not found:
-        return f"No files in {show(start)} mention {' or '.join(repr(w) for w in words)}."
+        return f"No files in {show(start)} mention {' or '.join(repr(w) for w in words)}." + note
     found.sort(key=lambda f: -f[0])
     out = [f"{name}\n" + "\n".join(lines) if lines else f"{name}  (name matches)" for _, name, lines in found[:20]]
     more = f"\n\n... and {len(found) - 20} more files" if len(found) > 20 else ""
-    return "\n\n".join(out) + more
+    return "\n\n".join(out) + more + note
 
 
 def write_file(path, content) -> str:
