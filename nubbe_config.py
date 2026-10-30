@@ -46,6 +46,7 @@ DEFAULTS = {
     },
     "tools": {
         "workspace_dir": "*",
+        "hands": True,
     },
     "web": {
         "web_enabled": True,

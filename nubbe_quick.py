@@ -283,6 +283,11 @@ class QuickBar:
         focus(find_window(TITLE))
         self._window.run_js("window.quickOpened && quickOpened(false)")
 
+    def show(self) -> None:
+        """Pops the bar up (for a Yes/No card during a voice call)."""
+        if not self._visible:
+            self.toggle()
+
     def hide(self) -> None:
         self._window.hide()
         self._visible = False
@@ -538,6 +543,8 @@ events.onmessage = e => {
   const d = JSON.parse(e.data);
   if (d.event === 'chat' && d.current && !busy) follow(d.chat_id);
   if (d.event === 'call') showCall(d.in_call);
+  if (d.event === 'confirm' && !busy) { confirmCard(d); face('curious'); }   // asked on a voice call
+  if (d.event === 'confirmed' && cardId === d.id) settleCard(d.ok);
   if (d.state && !busy) face(d.state);
 };
 // clicking the bar after using another app: take keyboard focus back (Windows won't do it on its own here)

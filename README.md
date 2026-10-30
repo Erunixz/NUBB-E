@@ -2,7 +2,7 @@
 
 NUBB-E ("noobee") is a personal AI that runs on your own laptop: a local brain, an animated face, text and voice chat, saved chats, and a memory about you. It works fully offline, and goes online only to look things up when a question needs it.
 
-The full setup guide comes later. For now, this covers the web, files and voice.
+The full setup guide comes later. For now, this covers the web, files, hands and voice.
 
 ## Web
 
@@ -27,6 +27,19 @@ NUBB-E can look at the files on your laptop and answer from them: "what's in my 
 - **Everything is logged** in `~/.nubbe/tools.log` (file names and commands, not your file contents).
 
 This is `workspace_dir = "*"` in `config.toml`. To keep NUBB-E to one folder instead, set something like `workspace_dir = "~/Documents/Notes"`. `""` turns the file tools off. They work in the app and the quick bar. Voice calls skip them to stay fast.
+
+## Hands (filling in forms)
+
+Open a form or doc, then ask NUBB-E from the quick bar or a call: "fill this out for me". It looks at the screen, works out what goes in each field, and shows you the plan on a card first, including which window it will type into. Nothing is typed until you press **Yes**.
+
+- **It only uses what you told it:** your memories, your request and the chat. If something's missing (like your email), it leaves that field and asks you.
+- **Never:** passwords, payment, bank or ID fields, and it never presses Submit or Send. That part is always yours.
+- **You can stop it anytime:** press **Esc** or move the mouse, and it stops right away.
+- **It checks its work:** after each field it looks again, and stops if the text didn't land where it should.
+- **Safe places only:** it won't type into terminals or code editors (typing there could run commands), and it stops if another window moves in front of the form.
+- **Not yet:** dropdowns, checkboxes and radio buttons. Only the main screen.
+
+Every step is logged in `~/.nubbe/tools.log` (field names, not what was typed). Set `hands = false` in `config.toml` to turn it off.
 
 ## Voice
 

@@ -105,6 +105,7 @@ def data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "LAST_LOOK", {})
     monkeypatch.setattr(app.tools, "WORKSPACE_DIR", "")   # file tools off unless a test gives a temp workspace
     monkeypatch.setattr(app.web, "_net", {"online": False, "until": 1e18})   # no real internet in tests
+    monkeypatch.setattr(app, "HANDS", False)          # no clicking on the real screen in tests
     app.init_db()
     return d
 

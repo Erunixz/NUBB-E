@@ -76,6 +76,7 @@ from nubbe_face import FACE_JS, FACE_STATES   # shared face engine (keep nubbe_f
 from nubbe_quick import QUICK_PAGE            # quick bar page (keep nubbe_quick.py next to this file)
 import nubbe_tools as tools                   # file tools, only inside workspace_dir (keep next to this file)
 import nubbe_web as web                       # web search and page reading, only when online (keep next to this file)
+import nubbe_hands as hands                   # fills in forms on screen after a Yes (keep next to this file)
 
 VOICE_RULES = (
     "\n\n## Voice call\n"
@@ -128,6 +129,8 @@ LOOK_MEMORY_SECONDS = 600   # a screenshot stays in the conversation (in RAM onl
 LAST_LOOK: dict[int, dict] = {}   # chat id -> {"image", "msg_id", "time"}; never written to disk
 CURRENT = {"chat_id": None}       # the chat open in the app, shared with the quick bar
 VISION = bool(CFG["brain"].get("mmproj"))
+HANDS = VISION and CFG["tools"]["hands"] and hands.IS_WINDOWS   # needs eyes to see the form
+APP_HOOKS = {"show_quick": None}   # set by the window code: pops the quick bar up for a voice call's Yes/No card
 MAX_TOOL_ROUNDS = 6         # tool calls per reply before NUBB-E has to answer
 CONFIRM_SECONDS = 300       # a Yes/No card with no answer counts as No
 PENDING: dict[str, dict] = {}   # confirmation card id -> {"event", "ok"}
@@ -349,15 +352,25 @@ BRAIN = Brain(idle_minutes=CFG["brain"]["idle_unload_minutes"])
 
 def setup(slot: int, chat_id=None) -> tuple[str, list | None]:
     """The system prompt and tools for a reply in this slot (warm-ups use the same, so the cache matches).
-    File tools: text chats only (voice stays fast). Web tools: everywhere, when Web is on and there's internet."""
+    File tools: text chats only (voice stays fast). Web tools: everywhere, when Web is on and there's internet.
+    Hands (filling forms on screen): everywhere, when vision is on."""
     switched_on = web.ENABLED and get_settings().get("web", False)
     net = switched_on and web.online()     # a local check, cached: normal chats never touch the network
     files = slot == CHAT_SLOT and tools.root() is not None
     system = system_prompt(chat_id) + (tools.rules() if files else "") + web.rules(switched_on, net, slot == VOICE_SLOT)
+    if HANDS:
+        system += hands.RULES
     if slot == VOICE_SLOT:
         system += VOICE_RULES
-    offered = (tools.SCHEMAS if files else []) + (web.SCHEMAS if net else [])
+    offered = (tools.SCHEMAS if files else []) + (web.SCHEMAS if net else []) + ([hands.SCHEMA] if HANDS else [])
     return system, offered or None
+
+
+def ask_vision(messages: list, max_tokens: int) -> str:
+    """One quick, no-thinking answer about an image (planning and checking form fields)."""
+    with BRAIN.use():
+        return "".join(v for k, v in llm_stream(messages, think=False, max_tokens=max_tokens, temperature=0,
+                                                slot=LOOK_SLOT) if k == "content")
 
 
 def warm_slot(slot: int) -> None:
@@ -754,6 +767,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         voice = bool(body.get("voice"))      # from nubbe_voice.py: short spoken replies
+        self.voice, self.asked = voice, text   # for tools: where to show a card, and Erfan's own words
         image = None
         if look:   # capture first, so it's the screen as it was when Erfan asked
             try:
@@ -817,12 +831,19 @@ class Handler(BaseHTTPRequestHandler):
                         if BRAIN.can_start else
                         "My brain isn't running. Start llama-server, or start me without --no-brain.")})
                     return
+                self.final = None   # a tool's own last word (filling a form), said instead of another brain round
+                # "fill this out" goes straight to the hands: the model doesn't always pick the tool by itself
+                fast = HANDS and not look and hands.wants_fill(text)
                 for rnd in range(MAX_TOOL_ROUNDS + 1):   # the last round has no tools, so it must answer
                     calls, said = [], ""
                     if offered and not web.online():     # the internet dropped mid-reply: no more retrying
                         offered = [t for t in offered if t["function"]["name"] not in web.TOOLS] or None
-                    for kind, val in llm_stream(messages, think=think, max_tokens=120 if voice else None,
-                                                slot=slot, tools=offered if rnd < MAX_TOOL_ROUNDS else None):
+                    if fast and rnd == 0:
+                        calls = [{"id": "call_fill", "type": "function", "function": {
+                            "name": "fill_form", "arguments": json.dumps({"request": text})}}]
+                    for kind, val in ([] if calls else llm_stream(
+                            messages, think=think, max_tokens=120 if voice else None, slot=slot,
+                            tools=offered if rnd < MAX_TOOL_ROUNDS else None)):
                         if kind == "reasoning":
                             if not told_reasoning:
                                 self.emit({"type": "reasoning"})
@@ -840,6 +861,11 @@ class Handler(BaseHTTPRequestHandler):
                     messages.append({"role": "assistant", "content": said, "tool_calls": calls})
                     for c in calls:
                         messages.append({"role": "tool", "tool_call_id": c["id"], "content": self.use_tool(c)})
+                    if self.final:   # what really happened, word for word (the model liked to retell it wrong)
+                        val = ("\n\n" if reply and not reply.endswith("\n") else "") + self.final
+                        reply += val
+                        self.emit({"type": "delta", "text": val})
+                        break
                     if voice:   # a long page pulls replies toward lists; remind it right where it reads the result
                         messages[-1]["content"] += VOICE_AFTER_TOOL
                     told_reasoning = False
@@ -878,23 +904,76 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             tools.log(DATA_DIR / "tools.log", name, {}, "error: arguments weren't valid JSON")
             return "Your tool arguments weren't valid JSON. Try again."
-        line = web.status(name, args) if name in web.TOOLS else tools.status(name, args)
+        line = (web.status(name, args) if name in web.TOOLS else "looking at the form" if name in hands.TOOLS
+                else tools.status(name, args))
         self.emit({"type": "tool", "name": name, "text": line})
         broadcast({"state": "thinking", "status": line[:60]})
         if name in web.TOOLS:   # read-only, so no card; only the search words or the link go online
             return web.call(name, args, DATA_DIR / "web.log")
+        if name in hands.TOOLS:
+            return self.fill_form(args) if HANDS else "Filling forms needs vision (mmproj in config.toml) on Windows."
         approved = None
         if tools.needs_yes(name) and name in tools.TOOLS:
-            cid = secrets.token_hex(16)
-            PENDING[cid] = {"event": threading.Event(), "ok": False}
-            try:
-                self.emit({"type": "confirm", "id": cid, **tools.card(name, args)})
-                PENDING[cid]["event"].wait(CONFIRM_SECONDS)
-                approved = PENDING[cid]["ok"]
-            finally:
-                del PENDING[cid]
-            self.emit({"type": "confirmed", "id": cid, "ok": approved})
+            approved = self.ask_yes(tools.card(name, args))
         return tools.call(name, args, DATA_DIR / "tools.log", approved)
+
+    def ask_yes(self, card: dict) -> bool:
+        """Shows a Yes/No card and waits. In a voice call the card goes to the quick bar and the app
+        window instead (the call has no screen of its own). No answer in time means No."""
+        cid = secrets.token_hex(16)
+        PENDING[cid] = {"event": threading.Event(), "ok": False}
+        try:
+            self.emit({"type": "confirm", "id": cid, **card})
+            if self.voice:
+                broadcast({"event": "confirm", "id": cid, **card})
+                if APP_HOOKS["show_quick"]:
+                    APP_HOOKS["show_quick"]()
+            PENDING[cid]["event"].wait(CONFIRM_SECONDS)
+            approved = PENDING[cid]["ok"]
+        finally:
+            del PENDING[cid]
+        self.emit({"type": "confirmed", "id": cid, "ok": approved})
+        if self.voice:
+            broadcast({"event": "confirmed", "id": cid, "ok": approved})
+        return approved
+
+    def fill_form(self, args: dict) -> str:
+        """Hands: look at the screen, plan, show the plan, and after Yes type it in field by field."""
+        log_file = DATA_DIR / "tools.log"
+        request = " ".join(str(args.get("request") or "").split())
+        details = str(args.get("details") or "").strip()
+        facts = [m["text"] for m in rows("SELECT text FROM memories ORDER BY id")]
+        facts += [f"Erfan just said: {self.asked}"] + ([f"From this chat: {details}"] if details else [])
+        def finish(text, outcome=None):   # the app says this itself, word for word
+            if outcome:
+                tools.log(log_file, "fill_form", {"request": request}, outcome)
+            self.final = text
+            return text
+
+        try:
+            plan = hands.plan_form(ask_vision, request or self.asked, facts)
+        except (ValueError, OSError, ImportError) as e:
+            return finish(f"I couldn't read the form on the screen ({e}).", f"error: couldn't read the form ({e})")
+        todo, skipped, missing = hands.review(plan)
+        tools.log(log_file, "fill_form", {"request": request}, f"plan: {len(todo)} to fill, "
+                  f"{len(skipped)} skipped, {len(missing)} missing")
+        if not todo:
+            return finish(hands.report([], None, [], skipped, missing))
+        try:
+            window = hands.target_window(todo)
+        except hands.TargetError as e:
+            return finish(f"I won't type there: {e}. Open the form in front and ask me again.", f"refused: {e}")
+        if not self.ask_yes(hands.card(todo, skipped, missing, window[1])):
+            return finish("Okay, I didn't type anything.", "declined")
+
+        def progress(line):
+            self.safe_emit({"type": "tool", "name": "fill_form", "text": line})
+            broadcast({"state": "thinking", "status": line[:60]})
+
+        def log(field, outcome):
+            tools.log(log_file, "fill_field", {"field": field["label"], "content": field["value"]}, outcome)
+        done, stopped = hands.fill(todo, ask_vision, progress, log, window=window)
+        return finish(hands.report(done, stopped, todo, skipped, missing))
 
     def safe_emit(self, obj):
         try:
@@ -953,6 +1032,7 @@ def run_pywebview(webview, url: str, background: bool) -> None:
         return
     import nubbe_quick
     bar = nubbe_quick.QuickBar(webview, url, open_main, quit_all)
+    APP_HOOKS["show_quick"] = bar.show
     nubbe_quick.on_ctrl_c(quit_all)
 
     def started():
@@ -1323,7 +1403,8 @@ function confirmCard(out, ev) {
   const answer = ok => { api('/api/confirm', { id: ev.id, ok }); settleCard(ev.id, ok); };
   el.querySelector('.no').onclick = () => answer(false);
   el.querySelector('.yes').onclick = () => answer(true);
-  msgs.insertBefore(el, out); msgs.scrollTop = msgs.scrollHeight;
+  if (out) msgs.insertBefore(el, out); else msgs.appendChild(el);   // no reply bubble: a card from a voice call
+  msgs.scrollTop = msgs.scrollHeight;
   el.querySelector('.no').focus();
 }
 function settleCard(id, ok) {
@@ -1425,6 +1506,8 @@ es.onmessage = e => {
   // or switch to it when the quick bar continued the current chat
   if (d.event === 'chat' && !busy) { if (chatId === d.chat_id || d.current) openChat(d.chat_id); else loadChats(); }
   if (d.event === 'call') showCall(d.in_call);
+  if (d.event === 'confirm' && !busy) { msgs.querySelector('.empty')?.remove(); confirmCard(null, d); setFace('curious'); }
+  if (d.event === 'confirmed') settleCard(d.id, d.ok);
   if (d.state && !busy) { setFace(d.state); if (d.status) faceStatus.textContent = d.status; }
   if (d.state) showMic(d.state, d.status);
 };

@@ -66,6 +66,11 @@ barge_in = true               # talk over NUBB-E to interrupt it (it pauses, and
 # Or set one folder, like "~/Documents/Notes", to keep it to that. "" turns the tools off.
 workspace_dir = "*"
 
+# Hands: "fill this out for me" on a form or doc on screen. NUBB-E shows the plan on a
+# Yes/No card first, then clicks and types one field at a time (Esc or moving the mouse
+# stops it). Never passwords, payment or ID fields, and never Submit. Needs vision (mmproj).
+hands = true
+
 [web]
 # NUBB-E can search the web and read pages, but only when a question needs it (news, prices,
 # weather, latest versions, a link you give it) and only when there's internet. Everything
