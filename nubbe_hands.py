@@ -24,7 +24,7 @@ import time
 from contextlib import contextmanager
 
 IS_WINDOWS = sys.platform == "win32"
-TOOLS = ("fill_form",)
+TOOLS = ("fill_form", "click_on")
 SUPPORTED = {"text", "textarea", "other"}       # dropdowns, checkboxes and radio buttons: not yet
 PRIVATE = re.compile(
     r"pass(word|code|phrase)|\bpin\b|card|cvv|cvc|security code|expir|iban|swift|routing|"
@@ -35,6 +35,13 @@ PRIVATE = re.compile(
 FILL_WORDS = re.compile(r"\bfill(ing)? (it|this|that|these|them|everything|the (form|fields?|blanks?)|"
                         r"(this|the) (form|doc|document|page)|(it |this |that )?(out|in))\b", re.IGNORECASE)
 HOW_TO = re.compile(r"\bhow (do|can|should|would|to)\b", re.IGNORECASE)
+# "click the ML research tab", "press on the tab where it says...", "open my portfolio tab", "switch to the Gmail tab"
+CLICK_WORDS = re.compile(r"\b(click|press|tap)(ing)?\b(?! (enter|escape|esc|ctrl|alt|shift)\b)|"
+                         r"\b(open|switch to|go to|bring up)\b.{0,60}\b(tab|button|link|icon)\b", re.IGNORECASE)
+# what NUBB-E never clicks: that's always Erfan's call
+NO_CLICK = re.compile(r"submit|send|post|publish|pay|buy|order|checkout|check out|purchase|delete|remove|"
+                      r"confirm|transfer|sign out|log ?out|install|uninstall|allow|accept|agree|unsubscribe|"
+                      r"place|book|reserve|donate|tweet|reply", re.IGNORECASE)
 # windows NUBB-E never types into: in a terminal (VS Code has one built in) typed text can run as a command
 NO_TYPING = re.compile(r"powershell|command prompt|cmd\.exe|windows terminal|\bterminal\b|git bash|\bwsl\b|"
                        r"ubuntu|visual studio code|^NUBB-E", re.IGNORECASE)
@@ -61,8 +68,27 @@ RULES = (
     "just call it. Pass any facts from this "
     "chat or his files in 'details'. Never invent facts about him: if something is missing, the tool tells "
     "you, and you ask him. You never fill passwords, payment or ID fields, and you never press Submit or "
-    "Send: tell him that part is his."
+    "Send: tell him that part is his. "
+    "To click something on his screen (a browser tab, a link, a button), call click_on with what to click in "
+    "his words. It finds it, asks him first, then clicks. Don't say you can't click: you can, with click_on."
 )
+
+CLICK_SCHEMA = {"type": "function", "function": {
+    "name": "click_on",
+    "description": "Click one thing on Erfan's screen, like a browser tab, a link or a button. This tool takes its "
+                   "own screenshot, finds it, asks Erfan first, then clicks. It never clicks Submit, Send, Pay, "
+                   "Delete and the like.",
+    "parameters": {"type": "object", "properties": {
+        "target": {"type": "string", "description": "What to click, in Erfan's words, like "
+                                                    "'the Erfan | ML research tab in Chrome'."},
+    }, "required": ["target"]}}}
+
+CLICK_PROMPT = """Erfan wants this clicked on his screen: "{target}"
+
+Find it in this screenshot. Reply with JSON only:
+{{"found": true, "label": "the text on it", "kind": "tab|link|button|menu|icon|other", "box": [x1, y1, x2, y2]}}
+box is where to click, as coordinates from 0 to 1000 relative to the image width and height.
+If it isn't on the screen, reply {{"found": false}}."""
 
 PLAN_PROMPT = """You're helping Erfan fill in what's on his screen. Find every field in this screenshot and decide what goes in each.
 
@@ -86,6 +112,11 @@ Rules:
 
 VERIFY_PROMPT = ("This is a close-up of a form field labeled \"{label}\". What text is typed inside the input box? "
                  "Reply with only that text, exactly as shown. If the box is empty, reply EMPTY.")
+
+
+def wants_click(text: str) -> bool:
+    """Erfan asked NUBB-E to click something on screen (the app then calls click_on directly)."""
+    return bool(CLICK_WORDS.search(text)) and not HOW_TO.search(text) and not wants_fill(text)
 
 
 def wants_fill(text: str) -> bool:
@@ -188,7 +219,9 @@ def card(todo, skipped, missing, window: str = "") -> dict:
     if missing:
         lines += ["", "I don't know: " + ", ".join(missing)]
     lines += ["", "I won't press Submit or Send. That part is yours."]
-    return {"title": "Fill in this form",
+    return {"say": f"I can fill {len(todo)} field{'s' if len(todo) != 1 else ''}"
+                   + (f" in {window}" if window else "") + ". The plan is on your screen. Say yes or no.",
+            "title": "Fill in this form",
             "target": (f"in \"{window}\": " if window else "") + f"{len(todo)} field{'s' if len(todo) != 1 else ''}, "
                       "one at a time. Esc or moving the mouse stops me.",
             "detail": "\n".join(lines)}
@@ -399,6 +432,56 @@ def target_window(todo: list, hands=None) -> tuple[int, str]:
     if NO_TYPING.search(title):
         raise TargetError(f"\"{title}\" looks like a terminal or code editor, and typing there could run commands")
     return hwnd, title
+
+
+def plan_click(ask, target: str) -> dict:
+    """Looks at the screen and finds the one thing to click."""
+    from look import hidden_window, screenshot_b64
+    with dpi_aware(), hidden_window():
+        shot = screenshot_b64(1, 1280)
+    answer = ask([{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{shot}"}},
+        {"type": "text", "text": CLICK_PROMPT.format(target=" ".join(target.split()))}]}], 200)
+    return parse_json(answer)
+
+
+def review_click(found: dict, target: str, hands=None) -> tuple[dict, tuple[int, str]]:
+    """Checks the spot is safe to click and finds its window. Raises TargetError with the reason."""
+    if not found.get("found"):
+        raise TargetError(f"I can't see \"{target}\" on the screen")
+    box = _box(found.get("box"))
+    if box is None:
+        raise TargetError("I couldn't tell exactly where it is")
+    label = " ".join(str(found.get("label") or target).split())[:80]
+    kind = str(found.get("kind") or "other").lower()
+    if kind != "tab" and NO_CLICK.search(label):   # a tab only switches tabs, whatever its title
+        raise TargetError(f"\"{label}\" is yours to press: I don't press Submit, Send, Pay, Delete and the like")
+    with dpi_aware():
+        hands = hands or Hands()
+        hwnd, title = hands.window_at(*hands.point(box))
+    if not hwnd:
+        raise TargetError("I couldn't tell which window it's in")
+    return {"label": label, "kind": kind, "box": box}, (hwnd, title)
+
+
+def click_card(spot: dict, window: tuple[int, str]) -> dict:
+    return {"title": "Click this", "target": f"in \"{window[1]}\"", "detail": f"{spot['label']} ({spot['kind']})",
+            "say": f"Should I click {spot['label']}? Say yes or no."}
+
+
+def click(spot: dict, window: tuple[int, str], hands=None) -> str:
+    """One click, after the Yes. The spot must still be in the same window."""
+    from look import hidden_window
+    with dpi_aware(), hidden_window():
+        hands = hands or Hands()
+        x, y = hands.point(spot["box"])
+        if hands.window_at(x, y)[0] != window[0]:
+            return f"I didn't click: \"{window[1]}\" isn't there anymore."
+        try:
+            hands.click(x, y)
+        except Stopped as e:
+            return f"I didn't click because {e}."
+    return f"Done, I clicked {spot['label']}."
 
 
 def text_for(field: dict) -> str:

@@ -219,6 +219,63 @@ IN_CALL = threading.Event()      # a hands-free call is on: go back to listening
 LAST_SPOKE = [0.0]               # when NUBB-E last finished a sentence (its echo can linger a moment)
 RECENT_SPEECH: list[str] = []    # what NUBB-E said lately, to spot its own voice coming back into the mic
 REPLY_SO_FAR = [""]             # the reply being written right now (its echo can only contain these words)
+VOICE_TOKEN = os.environ.get("NUBBE_VOICE_TOKEN", "")   # from the app: lets a spoken "yes" answer its Yes/No card
+
+
+class OutputMeter:
+    """How loud this computer is playing sound right now (every app together), read from Windows.
+    A call uses it to tell a video or music on the speakers from Erfan talking. Nothing is recorded.
+    Windows only (Core Audio through ctypes); elsewhere it always reads 0."""
+
+    def __init__(self):
+        self.meter = None
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            import uuid
+            self.ctypes = ctypes
+
+            class GUID(ctypes.Structure):
+                _fields_ = [("a", ctypes.c_ulong), ("b", ctypes.c_ushort), ("c", ctypes.c_ushort),
+                            ("d", ctypes.c_ubyte * 8)]
+
+            def guid(text):
+                return GUID.from_buffer_copy(uuid.UUID(text).bytes_le)
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
+            enum, device, meter = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+            if ctypes.windll.ole32.CoCreateInstance(
+                    ctypes.byref(guid("BCDE0395-E52F-467C-8E3D-C4579291692E")), None, 0x17,      # MMDeviceEnumerator
+                    ctypes.byref(guid("A95664D2-9614-4F35-A746-DE8DB63617E6")), ctypes.byref(enum)):
+                return
+            if self._call(enum, 4, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)],
+                          0, 1, ctypes.byref(device)):                                          # speakers
+                return
+            if self._call(device, 3, [ctypes.POINTER(GUID), ctypes.c_ulong, ctypes.c_void_p,
+                                      ctypes.POINTER(ctypes.c_void_p)],
+                          ctypes.byref(guid("C02216F6-8C67-4B5B-9D00-D008E73E0064")), 0x17, None,  # its level meter
+                          ctypes.byref(meter)):
+                return
+            self.meter = meter
+        except (OSError, AttributeError, ValueError):
+            self.meter = None
+
+    def _call(self, obj, index, argtypes, *args) -> int:
+        """Calls method number `index` of a COM object."""
+        c = self.ctypes
+        vtable = c.cast(obj, c.POINTER(c.POINTER(c.c_void_p))).contents
+        return c.WINFUNCTYPE(c.c_long, c.c_void_p, *argtypes)(vtable[index])(obj, *args)
+
+    def peak(self) -> float:
+        if not self.meter:
+            return 0.0
+        level = self.ctypes.c_float()
+        try:
+            if self._call(self.meter, 3, [self.ctypes.POINTER(self.ctypes.c_float)], self.ctypes.byref(level)):
+                return 0.0
+        except OSError:
+            return 0.0
+        return level.value
 
 
 class Player:
@@ -357,6 +414,8 @@ def _deltas_from(req, st: dict):
             elif obj.get("type") == "error":
                 raise ConnectionError(obj["text"])
             else:
+                if obj.get("type") == "tool" and st.get("on_tool"):
+                    st["on_tool"](obj.get("text", ""))
                 continue
             if piece:
                 yield piece
@@ -390,8 +449,20 @@ def _deltas(heard: str, st: dict, look: bool = False):
     yield from _deltas_from(req, st)
 
 
+TOOL_ACKS = (("searching", "Let me look that up."), ("reading", "Let me read that."),
+             ("looking at the form", "Let me look at the form."), ("looking for it", "Let me find it."))
+
+
 def stream_reply(heard: str, st: dict, speak_q: "queue.Queue[str | None]", look: bool = False) -> str:
     full, buf = "", ""
+    REPLY_SO_FAR[0] = ""
+    acked = []
+
+    def on_tool(line: str) -> None:   # a tool can take a while: say so once, right away
+        if not acked and not HUSH.is_set():
+            acked.append(1)
+            speak_q.put(next((say for start, say in TOOL_ACKS if line.startswith(start)), "One sec."))
+    st["on_tool"] = on_tool
     GENERATING.set()
     try:
         for delta in _deltas(heard, st, look):
@@ -569,8 +640,35 @@ def sounds_unfinished(text: str) -> bool:
     return bool(words) and words[-1] in UNFINISHED_ENDINGS and not t.endswith(("?", "!"))
 
 
-LOOK_WORDS = re.compile(r"\b(can you (look|see)|could you (look|see)|take a look|look (at|here)|"
-                        r"see my screen|on my screen|what am i (looking at|doing))\b", re.IGNORECASE)
+LOOK_WORDS = re.compile(r"\b(can you (look|see)|could you (look|see)|take a look|look (at|here|again|now)|"
+                        r"see my screen|on (my|the) screen|what am i (looking at|doing)|what (do|can) you see|"
+                        r"(what|how) about now|check (my|the) screen|see (it|this|that) now)\b", re.IGNORECASE)
+
+# a spoken answer to a Yes/No card ("yes", "yeah go ahead", "no thanks")
+SAID_YES = re.compile(r"(nubb?e?y? )?(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|go for it|please do|yes please|"
+                      r"click it|fill it( in)?)( (please|go ahead|do it))*")
+SAID_NO = re.compile(r"(nubb?e?y? )?(no|nope|nah|don't|do not|stop|cancel|never ?mind)( (thanks|thank you|don't))*")
+# "what?", "hello?" while NUBB-E is still working on an answer: not a new question
+STILL_THERE = re.compile(r"(what|huh|hello|hey|yo|hm+|uh+|um+|you there|are you there|still there|what's up)( buddy)?")
+
+
+def plain_words(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z' ]", " ", text.lower()).split())
+
+
+def answer_card(ok: bool) -> bool:
+    """Answers the app's waiting Yes/No card by voice. False if there's no card (or no token)."""
+    if not VOICE_TOKEN:
+        return False
+    base = APP_URL.replace("/api/chat", "/api/confirm")
+    try:
+        if not json.load(urllib.request.urlopen(base, timeout=2)).get("voice_pending"):
+            return False
+        req = urllib.request.Request(base, data=json.dumps({"token": VOICE_TOKEN, "ok": ok}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        return bool(json.load(urllib.request.urlopen(req, timeout=2)).get("ok"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
 
 
 def wants_look(text: str) -> bool:
@@ -634,6 +732,9 @@ class Call:
         speech: list[np.ndarray] = []
         loud = quiet = 0
         barged = False
+        speakers = OutputMeter()   # made on this thread: Windows audio objects like to stay on one
+        media: list[float] = []    # how loud other sound (a video, music) comes into the mic lately
+        last_played = 0.0
         while not self.hangup.is_set():
             if self.pending is not None and not speech and time.time() > self.pending_until:
                 audio, self.pending = self.pending, None     # no rest came: answer what we have
@@ -647,7 +748,24 @@ class Call:
             if talking and not self.barge_in:
                 pre, loud = [], 0        # interrupting turned off: wait until it's done talking
                 continue
-            gate = max(self.threshold * 2.5, self.echo * 3) if talking else self.threshold
+            # another app playing sound (not NUBB-E itself): it comes into the mic too, so a turn needs
+            # Erfan's voice to stand out above it, like with NUBB-E's own echo
+            if not talking and speakers.peak() > 0.02:   # NUBB-E's own voice doesn't count
+                last_played = time.time()
+            playing = not talking and time.time() - last_played < 1.0   # the meter blinks to 0 now and then
+            if playing and not speech:
+                media = (media + [level])[-50:]    # the last 5 s of it (a turn in progress isn't added)
+            elif time.time() - last_played > 5:
+                media = []                         # it stopped a while ago: back to normal
+            if playing and len(media) < 5:
+                gate = float("inf")                # just started: listen half a second to learn how loud it is
+            elif playing:
+                gate = max(self.threshold * 2.5, sorted(media)[int(len(media) * 0.8)] * 2.5)
+            else:
+                gate = max(self.threshold * 2.5, self.echo * 3) if talking else self.threshold
+            # the end of a sentence is when it drops back to the background, not to a silent room
+            quiet_bar = (max(self.threshold, sorted(media)[int(len(media) * 0.8)] * 1.3) if playing and media
+                         else self.threshold)
             if talking and not speech and loud == 0 and level <= gate:
                 # learn how loud its own echo is, slowly, and only while nobody seems to be talking
                 # (otherwise Erfan's quieter syllables would raise the bar he has to get over)
@@ -663,7 +781,7 @@ class Call:
                     set_face("listening")
                 continue
             speech.append(block)
-            quiet = 0 if level > self.threshold else quiet + 1
+            quiet = 0 if level > quiet_bar else quiet + 1
             if quiet * self.BLOCK >= SILENCE_SECONDS or len(speech) * self.BLOCK >= MAX_RECORD_SECONDS:
                 audio = np.concatenate(speech)
                 if self.pending is not None:                  # the rest of an unfinished sentence
@@ -682,6 +800,17 @@ class Call:
             self.pending, self.pending_until, self.pending_barged = audio, time.time() + 1.5, barged
             print(f"(waiting for the rest: {heard})", flush=True)
             return
+        words = plain_words(heard)
+        if (SAID_YES.fullmatch(words) or SAID_NO.fullmatch(words)) and answer_card(bool(SAID_YES.fullmatch(words))):
+            PLAYER.resume()                        # answered the Yes/No card: the waiting reply carries on
+            self.speak_q.put("On it." if SAID_YES.fullmatch(words) else "Okay, I won't.")
+            print(f"(you said {'yes' if SAID_YES.fullmatch(words) else 'no'} to the card)", flush=True)
+            return
+        if barged and GENERATING.is_set() and not REPLY_SO_FAR[0].strip() and STILL_THERE.fullmatch(words):
+            PLAYER.resume()                        # still working on the answer: don't throw it away
+            self.speak_q.put("Still on it, one sec.")
+            print(f"(still working: {heard})", flush=True)
+            return
         if barged:
             hush(self.speak_q)                     # it was really Erfan: drop the rest of the old reply
         if self.reply and self.reply.is_alive():   # let the interrupted reply wind down
@@ -692,6 +821,8 @@ class Call:
         set_face("thinking", heard, who="you")
 
         look = wants_look(heard)
+        if look:
+            self.speak_q.put("Let me look.")       # a look takes a few seconds: say so right away
 
         def reply():
             try:

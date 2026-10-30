@@ -130,6 +130,7 @@ LAST_LOOK: dict[int, dict] = {}   # chat id -> {"image", "msg_id", "time"}; neve
 CURRENT = {"chat_id": None}       # the chat open in the app, shared with the quick bar
 VISION = bool(CFG["brain"].get("mmproj"))
 HANDS = VISION and CFG["tools"]["hands"] and hands.IS_WINDOWS   # needs eyes to see the form
+VOICE_TOKEN = secrets.token_hex(16)   # only the voice helper we start knows it: a spoken "yes" can't be faked
 APP_HOOKS = {"show_quick": None}   # set by the window code: pops the quick bar up for a voice call's Yes/No card
 MAX_TOOL_ROUNDS = 6         # tool calls per reply before NUBB-E has to answer
 CONFIRM_SECONDS = 300       # a Yes/No card with no answer counts as No
@@ -362,7 +363,7 @@ def setup(slot: int, chat_id=None) -> tuple[str, list | None]:
         system += hands.RULES
     if slot == VOICE_SLOT:
         system += VOICE_RULES
-    offered = (tools.SCHEMAS if files else []) + (web.SCHEMAS if net else []) + ([hands.SCHEMA] if HANDS else [])
+    offered = (tools.SCHEMAS if files else []) + (web.SCHEMAS if net else []) + ([hands.SCHEMA, hands.CLICK_SCHEMA] if HANDS else [])
     return system, offered or None
 
 
@@ -413,7 +414,8 @@ class Voice:
                 self.proc = subprocess.Popen(
                     [sys.executable, str(HERE / "nubbe_voice.py"), "--serve"], cwd=HERE,
                     stdin=subprocess.PIPE, stdout=self.log, stderr=subprocess.STDOUT, text=True,
-                    env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1"))
+                    env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1",
+                             NUBBE_VOICE_TOKEN=VOICE_TOKEN))
                 self.job = tie_to_app(self.proc)
                 broadcast({"state": "thinking", "status": "connecting..."})
                 status = "starting"
@@ -668,6 +670,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(CURRENT)
         elif path == "/api/voice":
             self.send_json({"in_call": VOICE.in_call})
+        elif path == "/api/confirm":     # the voice helper asks: is a card waiting for a spoken yes or no?
+            self.send_json({"voice_pending": any(c.get("voice") for c in PENDING.values())})
         else:
             self.send_error(404)
 
@@ -704,6 +708,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": ok})
         elif path == "/api/confirm":     # Erfan pressed Yes or No on a tool card
             card = PENDING.get(str(body.get("id", "")))
+            if not card and body.get("token") == VOICE_TOKEN:   # or said it out loud on a call
+                card = next((c for c in reversed(PENDING.values()) if c.get("voice")), None)
             if card:
                 card["ok"] = body.get("ok") is True
                 card["event"].set()
@@ -833,14 +839,15 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.final = None   # a tool's own last word (filling a form), said instead of another brain round
                 # "fill this out" goes straight to the hands: the model doesn't always pick the tool by itself
-                fast = HANDS and not look and hands.wants_fill(text)
+                fast = HANDS and not look and ("fill_form" if hands.wants_fill(text) else
+                                                "click_on" if hands.wants_click(text) else None)
                 for rnd in range(MAX_TOOL_ROUNDS + 1):   # the last round has no tools, so it must answer
                     calls, said = [], ""
                     if offered and not web.online():     # the internet dropped mid-reply: no more retrying
                         offered = [t for t in offered if t["function"]["name"] not in web.TOOLS] or None
                     if fast and rnd == 0:
-                        calls = [{"id": "call_fill", "type": "function", "function": {
-                            "name": "fill_form", "arguments": json.dumps({"request": text})}}]
+                        calls = [{"id": "call_hands", "type": "function", "function": {
+                            "name": fast, "arguments": json.dumps({"request": text, "target": text})}}]
                     for kind, val in ([] if calls else llm_stream(
                             messages, think=think, max_tokens=120 if voice else None, slot=slot,
                             tools=offered if rnd < MAX_TOOL_ROUNDS else None)):
@@ -904,14 +911,16 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             tools.log(DATA_DIR / "tools.log", name, {}, "error: arguments weren't valid JSON")
             return "Your tool arguments weren't valid JSON. Try again."
-        line = (web.status(name, args) if name in web.TOOLS else "looking at the form" if name in hands.TOOLS
-                else tools.status(name, args))
+        line = (web.status(name, args) if name in web.TOOLS else "looking at the form" if name == "fill_form"
+                else "looking for it on the screen" if name == "click_on" else tools.status(name, args))
         self.emit({"type": "tool", "name": name, "text": line})
         broadcast({"state": "thinking", "status": line[:60]})
         if name in web.TOOLS:   # read-only, so no card; only the search words or the link go online
             return web.call(name, args, DATA_DIR / "web.log")
         if name in hands.TOOLS:
-            return self.fill_form(args) if HANDS else "Filling forms needs vision (mmproj in config.toml) on Windows."
+            if not HANDS:
+                return "Using the screen needs vision (mmproj in config.toml) on Windows."
+            return self.fill_form(args) if name == "fill_form" else self.click_on(args)
         approved = None
         if tools.needs_yes(name) and name in tools.TOOLS:
             approved = self.ask_yes(tools.card(name, args))
@@ -921,10 +930,11 @@ class Handler(BaseHTTPRequestHandler):
         """Shows a Yes/No card and waits. In a voice call the card goes to the quick bar and the app
         window instead (the call has no screen of its own). No answer in time means No."""
         cid = secrets.token_hex(16)
-        PENDING[cid] = {"event": threading.Event(), "ok": False}
+        PENDING[cid] = {"event": threading.Event(), "ok": False, "voice": self.voice}
         try:
-            self.emit({"type": "confirm", "id": cid, **card})
-            if self.voice:
+            self.safe_emit({"type": "confirm", "id": cid, **card})
+            if self.voice:   # say the question, so Erfan can just answer "yes" out loud
+                self.safe_emit({"type": "delta", "text": card.get("say") or f"{card['title']}? Say yes or no."})
                 broadcast({"event": "confirm", "id": cid, **card})
                 if APP_HOOKS["show_quick"]:
                     APP_HOOKS["show_quick"]()
@@ -932,7 +942,7 @@ class Handler(BaseHTTPRequestHandler):
             approved = PENDING[cid]["ok"]
         finally:
             del PENDING[cid]
-        self.emit({"type": "confirmed", "id": cid, "ok": approved})
+        self.safe_emit({"type": "confirmed", "id": cid, "ok": approved})
         if self.voice:
             broadcast({"event": "confirmed", "id": cid, "ok": approved})
         return approved
@@ -974,6 +984,26 @@ class Handler(BaseHTTPRequestHandler):
             tools.log(log_file, "fill_field", {"field": field["label"], "content": field["value"]}, outcome)
         done, stopped = hands.fill(todo, ask_vision, progress, log, window=window)
         return finish(hands.report(done, stopped, todo, skipped, missing))
+
+    def click_on(self, args: dict) -> str:
+        """Hands: find one thing on screen, ask, and click it."""
+        log_file = DATA_DIR / "tools.log"
+        target = " ".join(str(args.get("target") or self.asked).split())
+
+        def finish(text, outcome):
+            tools.log(log_file, "click_on", {"target": target}, outcome)
+            self.final = text
+            return text
+        try:
+            spot, window = hands.review_click(hands.plan_click(ask_vision, target), target)
+        except hands.TargetError as e:
+            return finish(f"{str(e)[0].upper()}{str(e)[1:]}.", f"refused: {e}")
+        except (ValueError, OSError, ImportError) as e:
+            return finish(f"I couldn't read the screen ({e}).", f"error: {e}")
+        if not self.ask_yes(hands.click_card(spot, window)):
+            return finish("Okay, I didn't click anything.", "declined")
+        result = hands.click(spot, window)
+        return finish(result, "ok" if result.startswith("Done") else result)
 
     def safe_emit(self, obj):
         try:

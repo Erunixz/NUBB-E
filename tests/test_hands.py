@@ -316,3 +316,104 @@ def test_voice_card_pops_up_the_quick_bar(on, base, fake, monkeypatch):
 def test_hands_off_without_vision(base, fake):
     chat_answering(base, "Fill this out")
     assert "fill_form" not in str(chat_requests(fake)[-1].get("tools"))
+
+
+# ---------------------------------------------------------------------------
+# clicking one thing (a tab, a link), and answering a card out loud on a call
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("text, yes", [
+    ("Can you open my ML research tab on my Chrome, like my personal portfolio tab?", True),
+    ("No, like, press on the tab where it says L, Erfan, ML Research.", True),
+    ("switch to the Gmail tab", True), ("click the sign in link", True),
+    ("press enter", False), ("open the file notes.md", False), ("how do I click a link in python", False),
+    ("fill this out", False),
+])
+def test_wants_click(text, yes):
+    assert hands.wants_click(text) is yes
+
+
+def test_review_click_safety():
+    fh = FakeHands()
+    spot, window = hands.review_click({"found": True, "label": "Erfan | ML research", "kind": "tab",
+                                       "box": [100, 10, 200, 30]}, "my ML tab", fh)
+    assert spot == {"label": "Erfan | ML research", "kind": "tab", "box": [100.0, 10.0, 200.0, 30.0]}
+    assert window == (7, "Robotics Club Signup")
+    with pytest.raises(hands.TargetError, match="can't see"):
+        hands.review_click({"found": False}, "the moon", fh)
+    for label in ("Submit", "Send message", "Pay now", "Delete account", "Place order"):
+        with pytest.raises(hands.TargetError, match="yours to press"):
+            hands.review_click({"found": True, "label": label, "kind": "button", "box": [1, 1, 9, 9]}, label, fh)
+    # a tab just switches tabs, whatever its title says
+    assert hands.review_click({"found": True, "label": "Send money - Gmail", "kind": "tab", "box": [1, 1, 9, 9]},
+                              "gmail", fh)[0]["kind"] == "tab"
+
+
+def test_click_only_in_the_same_window():
+    spot = {"label": "Docs", "kind": "tab", "box": [100, 10, 200, 30]}
+    fh = FakeHands()
+    assert hands.click(spot, (7, "Chrome"), fh) == "Done, I clicked Docs."
+    assert fh.actions == [("click", 288, 22)]
+    fh = FakeHands(windows=lambda x, y: (9, "Other"))
+    assert hands.click(spot, (7, "Chrome"), fh) == "I didn't click: \"Chrome\" isn't there anymore."
+    assert fh.actions == []
+
+
+@pytest.fixture
+def clicks(monkeypatch, base):
+    monkeypatch.setattr(app, "HANDS", True)
+    seen = {"targets": [], "clicked": []}
+    spot = {"label": "Erfan | ML research", "kind": "tab", "box": [100, 10, 200, 30]}
+    monkeypatch.setattr(hands, "plan_click", lambda ask, target: seen["targets"].append(target) or {})
+    monkeypatch.setattr(hands, "review_click", lambda found, target: (spot, (7, "Google Chrome")))
+    monkeypatch.setattr(hands, "click", lambda s, w: seen["clicked"].append(s["label"]) or f"Done, I clicked {s['label']}.")
+    return seen
+
+
+def test_open_my_tab_asks_then_clicks(clicks, base, fake):
+    events = chat_answering(base, "Can you open my ML research tab?", answer=True)
+    card = next(e for e in events if e["type"] == "confirm")
+    assert card["title"] == "Click this" and card["target"] == 'in "Google Chrome"'
+    assert card["detail"] == "Erfan | ML research (tab)"
+    assert clicks["clicked"] == ["Erfan | ML research"] and chat_requests(fake) == []   # straight to the hands
+    assert reply_of(events) == "Done, I clicked Erfan | ML research."
+    assert [e["text"] for e in events if e["type"] == "tool"] == ["looking for it on the screen"]
+
+
+def test_click_no_means_no(clicks, base, fake):
+    events = chat_answering(base, "click the ML research tab", answer=False)
+    assert clicks["clicked"] == [] and reply_of(events) == "Okay, I didn't click anything."
+
+
+def test_the_model_can_click_too(clicks, base, fake):
+    fake.plan = [("click_on", {"target": "the portfolio tab"})]
+    chat_answering(base, "Bring my portfolio up for me", answer=True)
+    assert clicks["targets"] == ["the portfolio tab"] and clicks["clicked"] == ["Erfan | ML research"]
+    assert "click_on" in [t["function"]["name"] for t in chat_requests(fake)[0]["tools"]]
+
+
+def test_a_call_can_answer_out_loud(clicks, base, fake):
+    result = {}
+
+    def call():
+        result["events"] = chat_answering(base, "open my ML research tab", voice=True, source="call")
+    t = threading.Thread(target=call)
+    t.start()
+    assert wait_for(lambda: app.PENDING)
+    assert get(base, "/api/confirm") == {"voice_pending": True}
+    assert post(base, "/api/confirm", {"token": "wrong", "ok": True}) == {"ok": False}   # a web page can't fake it
+    assert post(base, "/api/confirm", {"token": app.VOICE_TOKEN, "ok": True}) == {"ok": True}
+    t.join(10)
+    said = reply_of(result["events"])
+    assert said.startswith("Should I click Erfan | ML research? Say yes or no.")   # asked out loud on the call
+    assert said.endswith("Done, I clicked Erfan | ML research.") and clicks["clicked"] == ["Erfan | ML research"]
+    assert get(base, "/api/confirm") == {"voice_pending": False}
+
+
+def test_text_chat_cards_cant_be_answered_by_voice(clicks, base, fake):
+    def press_no_later():
+        assert wait_for(lambda: app.PENDING)
+        assert post(base, "/api/confirm", {"token": app.VOICE_TOKEN, "ok": True}) == {"ok": False}
+        post(base, "/api/confirm", {"id": next(iter(app.PENDING)), "ok": False})
+    threading.Thread(target=press_no_later).start()
+    chat_answering(base, "click the ML research tab")
+    assert clicks["clicked"] == []
