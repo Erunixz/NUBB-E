@@ -613,3 +613,148 @@ def test_call_state_is_shared(base, fake, monkeypatch):
                                  headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=5).close()
     assert get(base, "/api/voice") == {"in_call": False}
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.7a: lockdown (web pages can't use the app), wake early, one copy only
+# ---------------------------------------------------------------------------
+def status_of(base, path, method="GET", body=None, headers=None) -> int:
+    """HTTP status for a request with exactly these headers (like a browser on another site would send)."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def test_other_websites_are_blocked(base):
+    port = base.rsplit(":", 1)[1]
+    evil = {"Origin": "https://evil.example"}
+    assert status_of(base, "/api/chats", headers=evil) == 403
+    assert status_of(base, "/api/memory", headers={"Host": f"evil.example:{port}"}) == 403   # DNS rebinding
+    assert status_of(base, "/api/chats", headers={"Sec-Fetch-Site": "cross-site"}) == 403
+    assert status_of(base, "/api/chats", headers={"Origin": "null"}) == 403                 # sandboxed page
+    # a form or no-cors fetch from another site can only send text/plain: never accepted
+    assert status_of(base, "/api/memory", "POST", {"text": "planted fact"},
+                     {"Content-Type": "text/plain"}) == 403
+    assert status_of(base, "/api/memory", "POST", {"text": "planted fact"},
+                     {"Content-Type": "application/json", **evil}) == 403
+    assert get(base, "/api/memory") == []
+
+
+def test_own_pages_and_scripts_still_work(base):
+    port = base.rsplit(":", 1)[1]
+    for own in ({}, {"Origin": f"http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
+                {"Host": f"localhost:{port}", "Origin": f"http://localhost:{port}"}):
+        assert status_of(base, "/api/chats", headers=own) == 200
+        assert status_of(base, "/api/memory", "POST", {"text": "likes robots"},
+                         {"Content-Type": "application/json; charset=utf-8", **own}) == 200
+    assert status_of(base, "/", headers={"Sec-Fetch-Site": "none"}) == 200     # typed into the address bar
+
+
+def test_web_page_cannot_press_yes(base):
+    card = {"event": threading.Event(), "ok": False, "voice": False}
+    app.PENDING["abc"] = card
+    try:
+        port = base.rsplit(":", 1)[1]
+        assert status_of(base, "/api/confirm", "POST", {"id": "abc", "ok": True},
+                         {"Content-Type": "application/json", "Origin": "https://evil.example"}) == 403
+        assert status_of(base, "/api/confirm", "POST", {"id": "abc", "ok": True}, {"Content-Type": "text/plain"}) == 403
+        assert not card["event"].is_set() and card["ok"] is False
+        assert status_of(base, "/api/confirm", "POST", {"id": "abc", "ok": True},
+                         {"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"}) == 200
+        assert card["event"].is_set() and card["ok"] is True
+    finally:
+        app.PENDING.pop("abc", None)
+
+
+def test_wake_early_starts_a_sleeping_brain(serve, owned_brain):
+    with owned_brain.lock:
+        owned_brain.start()
+    assert owned_brain.ensure()
+    time.sleep(0.6)
+    assert owned_brain.sleep_if_idle()
+    assert post(serve, "/api/wake", {}) == {"state": "waking"}      # starts loading, doesn't wait
+    assert owned_brain.proc is not None
+    assert wait_for(app.llm_alive, 10)
+    assert post(serve, "/api/wake", {})["state"] == "online"        # already up: nothing to do
+
+
+def test_wake_never_starts_a_brain_it_doesnt_own(base, fake):
+    assert post(base, "/api/wake", {})["state"] == "online"
+    assert app.BRAIN.proc is None
+
+
+def test_wake_counts_as_use(owned_brain):
+    with owned_brain.lock:
+        owned_brain.start()
+    assert owned_brain.ensure()
+    time.sleep(0.4)
+    owned_brain.wake()                       # Erfan opened the bar right before the brain would sleep
+    time.sleep(0.2)
+    assert not owned_brain.sleep_if_idle()
+
+
+def test_brain_stays_awake_during_a_call(owned_brain):
+    with owned_brain.lock:
+        owned_brain.start()
+    assert owned_brain.ensure()
+    owned_brain.busy = lambda: True
+    time.sleep(0.6)
+    assert not owned_brain.sleep_if_idle()
+    owned_brain.busy = lambda: False         # call ended: the idle clock starts now
+    assert not owned_brain.sleep_if_idle()
+    time.sleep(0.6)
+    assert owned_brain.sleep_if_idle()
+
+
+def test_call_and_mic_wake_the_brain(monkeypatch, data_dir):
+    woke = []
+    monkeypatch.setattr(app, "BRAIN", type("B", (), {"wake": lambda self: woke.append(1)})())
+    v = app.Voice()
+    for cmd in ("stop", "hangup"):
+        v.send(cmd)
+    assert woke == []
+    monkeypatch.setattr(app.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("no helper in tests")))
+    for cmd in ("call", "listen"):
+        with pytest.raises(OSError):
+            v.send(cmd)
+    assert woke == [1, 1]
+
+
+def test_second_start_shows_the_running_copy(base, monkeypatch):
+    port = int(base.rsplit(":", 1)[1])
+    shown = []
+    monkeypatch.setitem(app.APP_HOOKS, "show_main", lambda: shown.append(1))
+    assert app.already_running(port)
+    app.show_running_copy(port, browser=False)
+    assert shown == [1]
+
+
+def test_second_start_without_a_window_opens_the_page(base, monkeypatch):
+    port = int(base.rsplit(":", 1)[1])
+    opened = []
+    monkeypatch.setitem(app.APP_HOOKS, "show_main", None)
+    monkeypatch.setattr(app, "open_window", lambda url, force_browser, background=False: opened.append(url))
+    app.show_running_copy(port, browser=False)
+    assert opened == [base]
+
+
+def test_port_used_by_something_else_is_not_nubbe():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen()
+        assert not app.already_running(s.getsockname()[1])
+
+
+def test_second_copy_cannot_share_the_port():
+    """Windows lets two programs share a port with SO_REUSEADDR: the app must take it exclusively."""
+    first = app.AppServer(("127.0.0.1", 0), app.Handler)
+    try:
+        with pytest.raises(OSError):
+            app.AppServer(("127.0.0.1", first.server_address[1]), app.Handler)
+    finally:
+        first.server_close()

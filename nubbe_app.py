@@ -45,6 +45,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -131,7 +132,9 @@ CURRENT = {"chat_id": None}       # the chat open in the app, shared with the qu
 VISION = bool(CFG["brain"].get("mmproj"))
 HANDS = VISION and CFG["tools"]["hands"] and hands.IS_WINDOWS   # needs eyes to see the form
 VOICE_TOKEN = secrets.token_hex(16)   # only the voice helper we start knows it: a spoken "yes" can't be faked
-APP_HOOKS = {"show_quick": None}   # set by the window code: pops the quick bar up for a voice call's Yes/No card
+# set by the window code: show_quick pops the quick bar up for a voice call's Yes/No card,
+# show_main brings the app window back when NUBB-E is started a second time
+APP_HOOKS = {"show_quick": None, "show_main": None}
 MAX_TOOL_ROUNDS = 6         # tool calls per reply before NUBB-E has to answer
 CONFIRM_SECONDS = 300       # a Yes/No card with no answer counts as No
 PENDING: dict[str, dict] = {}   # confirmation card id -> {"event", "ok"}
@@ -243,6 +246,7 @@ class Brain:
         self.active = 0              # replies in progress (never unload during one)
         self.last_used = time.time()
         self.lock = threading.Lock()
+        self.busy = lambda: False    # set below: True while a voice call is on (never sleep mid-call)
 
     def status(self) -> str:
         if llm_alive():
@@ -280,6 +284,19 @@ class Brain:
                 return
             time.sleep(0.5)
         warm_slot(CHAT_SLOT)
+
+    def wake(self) -> str:
+        """Wake early: start loading now without waiting (Erfan opened the quick bar, pressed Call or
+        started typing), so most of the load hides behind his typing or talking. Also counts as use,
+        so an awake brain isn't put to sleep right as he's about to ask something."""
+        with self.lock:
+            self.last_used = time.time()
+            if self.can_start and self.asleep and not llm_alive():
+                self.start()
+                broadcast({"state": "sleep", "status": "waking up"})
+                print("Waking the brain early (you're about to ask something).")
+                return "waking"
+        return self.status()
 
     def ensure(self, on_wait=None, timeout=600) -> bool:
         """Makes sure the brain is up, waking it if needed. Calls on_wait() once if we have to wait."""
@@ -330,6 +347,8 @@ class Brain:
 
     def sleep_if_idle(self) -> bool:
         with self.lock:
+            if self.busy():
+                self.last_used = time.time()   # a call is on: the idle clock starts when it ends
             idle = (self.proc and self.proc.poll() is None and not self.active
                     and time.time() - self.last_used > self.idle_seconds)
             if idle:
@@ -398,6 +417,8 @@ class Voice:
         self.lock = threading.Lock()
 
     def send(self, cmd: str) -> str:
+        if cmd in ("call", "listen"):
+            BRAIN.wake()    # he's about to talk: the brain loads while he does
         with self.lock:
             if cmd in ("call", "hangup"):
                 self.in_call = cmd == "call"
@@ -448,6 +469,7 @@ class Voice:
 
 
 VOICE = Voice()
+BRAIN.busy = lambda: VOICE.in_call
 
 
 def system_prompt(chat_id=None) -> str:
@@ -624,8 +646,38 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.guarded(self.post)
 
+    def from_us(self) -> bool:
+        """Only NUBB-E's own windows and scripts may use the app. A web page Erfan visits can send
+        requests to 127.0.0.1 too, so without this it could press Yes on a card, start a chat or (with a
+        DNS trick) read his chats and memories.
+          Host:   must name this app, which blocks DNS rebinding (evil.com pointed at 127.0.0.1)
+          Origin: browsers add it to cross-site requests; it must be this app's own page
+          Sec-Fetch-Site: browsers say when a request comes from another site
+          POST:   must be JSON, which a page on another site can't send without asking first (CORS)"""
+        port = self.server.server_address[1]
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if self.headers.get("Host", "") not in hosts:
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in {f"http://{h}" for h in hosts}:
+            return False
+        if self.headers.get("Sec-Fetch-Site", "none") not in ("same-origin", "none"):
+            return False
+        if self.command == "POST":
+            kind = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            return kind == "application/json"
+        return True
+
     def guarded(self, route):
         """A broken request or DB hiccup gets a clean error, never a crashed handler."""
+        if not self.from_us():
+            print(f"Blocked a request from outside NUBB-E: {self.command} {self.path.split('?')[0]} "
+                  f"(from {self.headers.get('Origin') or self.headers.get('Host') or 'unknown'})")
+            try:
+                self.send_error(403)
+            except OSError:
+                pass
+            return
         try:
             route()
         except (sqlite3.Error, ValueError, TypeError) as e:
@@ -700,6 +752,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(CURRENT)
         elif path == "/api/look":
             self.chat(body, look=True)
+        elif path == "/api/wake":         # Erfan started typing: load the brain now if it's asleep
+            self.send_json({"state": BRAIN.wake()})
+        elif path == "/api/show":         # NUBB-E was started a second time: show this copy instead
+            show = APP_HOOKS["show_main"]
+            if show:
+                show()
+            self.send_json({"shown": bool(show)})
         elif path == "/api/open":        # a link in an answer: open it in the normal browser
             url = str(body.get("url", ""))
             ok = url.startswith(("https://", "http://"))
@@ -1053,6 +1112,7 @@ def run_pywebview(webview, url: str, background: bool) -> None:
         state["main"] = w
 
     hotkey = CFG["app"]["quick_hotkey"]
+    APP_HOOKS["show_main"] = open_main
     if background and not quick:
         print("Background mode needs the quick bar (Windows, quick_bar = true). Opening the app window.")
     if not background or not quick:
@@ -1065,9 +1125,13 @@ def run_pywebview(webview, url: str, background: bool) -> None:
     APP_HOOKS["show_quick"] = bar.show
     nubbe_quick.on_ctrl_c(quit_all)
 
+    def on_hotkey():
+        threading.Thread(target=BRAIN.wake, daemon=True).start()   # loads while Erfan types
+        bar.toggle()
+
     def started():
         try:
-            nubbe_quick.listen_hotkey(hotkey, bar.toggle)
+            nubbe_quick.listen_hotkey(hotkey, on_hotkey)
             print(f"Quick bar ready: press {hotkey} from any app. Quit from its x button or Ctrl+C here.")
         except (OSError, ValueError) as e:
             print(e)
@@ -1096,6 +1160,44 @@ def open_window(url: str, force_browser: bool, background: bool = False) -> bool
     return False
 
 
+class AppServer(ThreadingHTTPServer):
+    """The app's web server. On Windows the usual SO_REUSEADDR would let a second NUBB-E (or any other
+    program) bind the same port at the same time, so it takes the port exclusively instead."""
+    daemon_threads = True
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self):
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def already_running(port: int) -> bool:
+    """True if the program on this port is NUBB-E (so a second start shows it instead of failing)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as r:
+            return "brain" in json.load(r)
+    except (OSError, ValueError):
+        return False
+
+
+def show_running_copy(port: int, browser: bool) -> None:
+    """One copy only: a second start asks the running NUBB-E to show its window and quits.
+    It never starts a second brain (only one 35B fits in the GPU)."""
+    url = f"http://127.0.0.1:{port}"
+    shown = False
+    if not browser:
+        try:
+            req = urllib.request.Request(url + "/api/show", data=b"{}", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                shown = bool(json.load(r).get("shown"))
+        except (OSError, ValueError):
+            pass
+    if not shown:   # the running copy has no window of its own (browser mode): open the page here
+        open_window(url, force_browser=True)
+    print("NUBB-E is already running, so I opened that one.")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="NUBB-E: your offline AI buddy.")
     p.add_argument("--no-brain", action="store_true", help="don't start llama-server")
@@ -1108,9 +1210,14 @@ def main() -> None:
 
     init_db()
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        server = AppServer(("127.0.0.1", args.port), Handler)
     except OSError:
-        sys.exit(f"Port {args.port} is busy. Is NUBB-E already open? (or change [app] port in config.toml)")
+        if not already_running(args.port):
+            sys.exit(f"Port {args.port} is busy with another program. Change [app] port in config.toml.")
+        if args.background or args.no_window:
+            sys.exit("NUBB-E is already running.")
+        show_running_copy(args.port, args.browser)
+        return
     server.daemon_threads = True
 
     BRAIN.can_start = not args.no_brain
@@ -1480,6 +1587,8 @@ $('composer').onsubmit = e => {
 };
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('composer').requestSubmit(); } });
 input.addEventListener('input', () => { input.style.height = ''; input.style.height = Math.min(input.scrollHeight, 180) + 'px'; });
+let lastWake = 0;   // started typing: wake the brain now, so it loads while you write (once a minute at most)
+input.addEventListener('input', () => { if (Date.now() - lastWake > 60000) { lastWake = Date.now(); api('/api/wake', {}).catch(() => {}); } });
 input.addEventListener('input', () => {   // eyes watch what you type, following along the line
   const r = input.getBoundingClientRect(), line = input.value.split('\n').pop();
   FACE.lookAt(r.left + 16 + Math.min(r.width - 32, line.length * 7.5), r.top + r.height / 2, 1500);

@@ -194,3 +194,63 @@ def test_answer_card_needs_the_token(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.7a: instant cues (made once in NUBB-E's voice, then played at once)
+# ---------------------------------------------------------------------------
+class CountingTTS:
+    def __init__(self):
+        self.made = []
+
+    def synth(self, text):
+        self.made.append(text)
+        return np.full(2400, 0.1, dtype=np.float32), 24000
+
+
+def test_cues_are_made_once_and_saved(tmp_path, monkeypatch):
+    monkeypatch.setattr(voice.Cues, "DIR", tmp_path)
+    tts = CountingTTS()
+    first = voice.Cues()
+    first.prepare(tts, "am_puck", 1.0)
+    assert len(tts.made) == len(voice.Cues.LINES)
+    assert len(list(tmp_path.rglob("*.wav"))) == len(voice.Cues.LINES)
+    again = voice.Cues()                          # next start: loaded from disk, nothing made
+    again.prepare(tts, "am_puck", 1.0)
+    assert len(tts.made) == len(voice.Cues.LINES)
+    audio, rate = again.get("On it.")
+    assert rate == 24000 and audio.size == 2400
+    voice.Cues().prepare(tts, "af_heart", 1.0)    # another voice gets its own set
+    assert len(tts.made) == 2 * len(voice.Cues.LINES)
+
+
+def test_speaker_plays_a_cue_without_making_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(voice.Cues, "DIR", tmp_path)
+    cues = voice.Cues()
+    cues.prepare(CountingTTS(), "am_puck", 1.0)
+    monkeypatch.setattr(voice, "CUES", cues)
+    monkeypatch.setattr(voice, "_face_follows_player", lambda q: None)
+    tts, q = CountingTTS(), queue.Queue()
+    played = []
+    monkeypatch.setattr(voice.PLAYER, "add", lambda audio, rate: played.append(rate))
+    worker = threading.Thread(target=voice.speaker_worker, args=(q, tts), daemon=True)
+    worker.start()
+    q.put("On it.")
+    q.put("Something brand new.")
+    q.put(None)
+    worker.join(5)
+    assert tts.made == ["Something brand new."] and len(played) == 2
+
+
+def test_waking_up_is_said_once(monkeypatch):
+    """When the brain was asleep, the app sends "waking" first: NUBB-E says so out loud, once."""
+    import io
+    stream = b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in (
+        {"type": "start", "chat_id": 1}, {"type": "waking"}, {"type": "waking"},
+        {"type": "delta", "text": "Hi there."}, {"type": "done"})) + b"data: [DONE]\n\n"
+    monkeypatch.setattr(voice.urllib.request, "urlopen", lambda req, *a, **k: io.BytesIO(stream))
+    q = queue.Queue()
+    st = {"use_app": True, "chat_id": None, "history": []}
+    voice.stream_reply("hello", st, q)
+    assert [q.get_nowait() for _ in range(q.qsize())] == ["Waking up, one sec.", "Hi there."]
+    assert st["chat_id"] == 1

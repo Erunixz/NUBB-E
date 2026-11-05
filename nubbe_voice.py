@@ -213,6 +213,51 @@ def load_tts(voice: str, speed: float, piper_fallback: str | None):
                          "or pass --piper-voice voices/<name>.onnx as a fallback.")
 
 
+class Cues:
+    """Instant cues: the short lines NUBB-E says a lot ("On it.", "Let me look that up.") are made once
+    with its own voice and saved in ~/.nubbe/cues/, so they play at once instead of waiting for Kokoro.
+    Any other sentence is made fresh as before. Changing the voice or speed makes a new set."""
+    LINES = ("Let me look that up.", "Let me read that.", "Let me look at the form.", "Let me find it.",
+             "One sec.", "Let me look.", "On it.", "Okay, I won't.", "Still on it, one sec.",
+             "Waking up, one sec.")
+    DIR = Path.home() / ".nubbe" / "cues"
+
+    def __init__(self):
+        self.audio: dict[str, tuple] = {}
+
+    def get(self, sentence: str):
+        return self.audio.get(sentence.strip())
+
+    def prepare(self, tts, voice: str, speed: float) -> None:
+        """Loads the saved cues, making any that are missing. Runs in the background after start-up."""
+        import hashlib
+        folder = self.DIR / re.sub(r"[^\w.-]", "_", f"{Path(voice).stem}-{speed}")
+        try:
+            import soundfile
+        except ImportError:
+            soundfile = None                       # still works, just made again each start
+        for line in self.LINES:
+            file = folder / (hashlib.sha1(line.encode()).hexdigest()[:12] + ".wav")
+            try:
+                if soundfile and file.exists():
+                    audio, rate = soundfile.read(file, dtype="float32")
+                else:
+                    with TTS_LOCK:                 # one sentence at a time: a real reply can be speaking
+                        audio, rate = tts.synth(clean_for_speech(line))
+                    audio = np.asarray(audio, dtype=np.float32)
+                    if np.abs(audio).max(initial=0) > 1.5:     # Piper gives 16-bit numbers
+                        audio = audio / 32768.0
+                    if soundfile and audio.size:
+                        folder.mkdir(parents=True, exist_ok=True)
+                        soundfile.write(file, audio, rate)
+                if audio.size:
+                    self.audio[line] = (audio, rate)
+            except Exception as e:                 # a cue is a nice extra: never stop the voice over one
+                print(f"(couldn't make the cue {line!r}: {e})", flush=True)
+
+
+CUES = Cues()
+TTS_LOCK = threading.Lock()      # the voice makes one sentence at a time
 HUSH = threading.Event()         # the mic button asked it to stop talking
 RECORDING = threading.Event()    # the mic is open right now
 IN_CALL = threading.Event()      # a hands-free call is on: go back to listening after each reply
@@ -366,10 +411,15 @@ def speaker_worker(q: "queue.Queue[str | None]", tts) -> None:
         sentence = q.get()
         if sentence is None:
             break
+        cue = CUES.get(sentence)
         sentence = clean_for_speech(sentence)
         if not sentence or HUSH.is_set():
             continue
-        audio, rate = tts.synth(sentence)
+        if cue:
+            audio, rate = cue
+        else:
+            with TTS_LOCK:
+                audio, rate = tts.synth(sentence)
         if audio.size and not HUSH.is_set():
             RECENT_SPEECH.append(sentence)
             del RECENT_SPEECH[:-6]
@@ -413,6 +463,10 @@ def _deltas_from(req, st: dict):
                 piece = obj["text"]
             elif obj.get("type") == "error":
                 raise ConnectionError(obj["text"])
+            elif obj.get("type") == "waking":          # the brain was asleep and is loading
+                if st.get("on_wake"):
+                    st["on_wake"]()
+                continue
             else:
                 if obj.get("type") == "tool" and st.get("on_tool"):
                     st["on_tool"](obj.get("text", ""))
@@ -462,7 +516,12 @@ def stream_reply(heard: str, st: dict, speak_q: "queue.Queue[str | None]", look:
         if not acked and not HUSH.is_set():
             acked.append(1)
             speak_q.put(next((say for start, say in TOOL_ACKS if line.startswith(start)), "One sec."))
-    st["on_tool"] = on_tool
+
+    def on_wake() -> None:   # loading the brain takes a moment: say so, so the silence isn't confusing
+        if not acked and not HUSH.is_set():
+            acked.append(1)
+            speak_q.put("Waking up, one sec.")
+    st["on_tool"], st["on_wake"] = on_tool, on_wake
     GENERATING.set()
     try:
         for delta in _deltas(heard, st, look):
@@ -527,6 +586,7 @@ def main() -> None:
 
     speak_q: "queue.Queue[str | None]" = queue.Queue()
     threading.Thread(target=speaker_worker, args=(speak_q, tts), daemon=True).start()
+    threading.Thread(target=CUES.prepare, args=(tts, args.voice, args.speed), daemon=True).start()
 
     st = {"use_app": True, "chat_id": None, "history": [{"role": "system", "content": system}]}
     if args.serve:
