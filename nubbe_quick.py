@@ -353,6 +353,10 @@ QUICK_PAGE = r"""<!doctype html>
   .actions { display: none; gap: 8px; padding: 0 16px 12px; }
   .actions.show { display: flex; }
   .hint { margin-left: auto; color: var(--muted); font-size: 12px; align-self: center; }
+  .music { display: none; gap: 6px; align-items: center; padding: 0 16px 10px; color: var(--muted); font-size: 13px; }
+  .music.show { display: flex; }
+  .music span { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .music button { padding: 3px 9px; }
 </style>
 </head>
 <body>
@@ -365,6 +369,9 @@ QUICK_PAGE = r"""<!doctype html>
     <button class="icon" id="appBtn" title="Open the NUBB-E app">&#9634;</button>
     <button class="icon" id="quitBtn" title="Quit NUBB-E">&times;</button>
   </div>
+  <div class="music" id="music"><span id="songName"></span>
+    <button id="prevBtn" title="Previous">&#9198;</button><button id="playBtn" title="Play / pause">&#9199;</button>
+    <button id="nextBtn" title="Next">&#9197;</button></div>
   <div class="chatname" id="chatName"></div>
   <div id="out"><div id="answer"></div></div>
   <div class="card" id="card">
@@ -517,8 +524,29 @@ async function follow(id) {
   } catch (e) {}
   fit();
 }
+// now playing (any player Windows knows about: Spotify, a browser tab, Media Player). Checked only for
+// two minutes after the bar opens, so a hidden bar costs nothing.
+let openedAt = 0;
+async function refreshMusic() {
+  try {
+    const m = await fetch('/api/media').then(r => r.json());
+    const on = !!(m.title || m.artist);
+    $('music').classList.toggle('show', on);
+    if (on) { $('songName').textContent = (m.playing ? '♪ ' : '⏸ ') + m.title + (m.artist ? ' — ' + m.artist : '');
+              $('playBtn').innerHTML = m.playing ? '&#9208;' : '&#9654;'; }
+    fit();
+  } catch (e) {}
+}
+setInterval(() => { if (Date.now() - openedAt < 120000) refreshMusic(); }, 4000);
+const mediaDo = action => fetch('/api/media', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                 body: JSON.stringify({ action }) }).then(() => setTimeout(refreshMusic, 400));
+$('prevBtn').onclick = () => mediaDo('previous');
+$('playBtn').onclick = () => mediaDo('play_pause');
+$('nextBtn').onclick = () => mediaDo('next');
+
 window.quickOpened = async (fresh = true) => {
   input.focus();
+  openedAt = Date.now(); refreshMusic();
   if (fresh) {
     input.select(); face('curious');
     try { const cur = await fetch('/api/current').then(r => r.json()); if (cur.chat_id !== chatId) follow(cur.chat_id); } catch (e) {}
@@ -545,6 +573,7 @@ events.onmessage = e => {
   if (d.event === 'call') showCall(d.in_call);
   if (d.event === 'confirm' && !busy) { confirmCard(d); face('curious'); }   // asked on a voice call
   if (d.event === 'confirmed' && cardId === d.id) settleCard(d.ok);
+  if (d.event === 'reminder' && !busy) { status('⏰ ' + d.text); face('surprised'); }
   if (d.state && !busy) face(d.state);
 };
 // clicking the bar after using another app: take keyboard focus back (Windows won't do it on its own here)

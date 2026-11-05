@@ -41,6 +41,20 @@ Open a form or doc, then ask NUBB-E from the quick bar or a call: "fill this out
 
 Every step is logged in `~/.nubbe/tools.log` (field names, not what was typed). Set `hands = false` in `config.toml` to turn it off.
 
+## Everyday actions
+
+Just say or type it, in the app, the quick bar or a call:
+
+- **Apps, folders, sites:** "open Calculator", "launch VS Code", "open my downloads folder", "open YouTube and search for lo-fi", "google best pizza near me", "go to github.com"
+- **Sound and music:** "volume 30", "turn it down", "mute", "pause the music", "next song", "what's playing?", "play Billie Jean on Spotify"
+- **Timers and reminders:** "timer 10 minutes", "10 minute timer for the pasta", "remind me at 6 to call mom", "remind me tomorrow at 9am to submit the report", "what are my reminders", "cancel the timer". When one is due, NUBB-E says it out loud, the face reacts and a Windows notification shows, even with no NUBB-E window open.
+- **To-do list and notes:** "add milk and eggs to my list", "what's on my list", "cross milk off my list", "take a note: ...", "search my notes for wifi". The **Lists** button in the app shows them all.
+- **Routines:** "make a routine called start my day: open Spotify and open Gmail", then just "start my day".
+- **Good morning:** the date, the weather (when Web is on), today's reminders and your list.
+- **Your PC:** "how's my laptop doing" (CPU, memory, battery, disk, GPU), "find my resume" (by name, shown in File Explorer, never opened or run).
+
+Simple commands like these are understood without the brain, so they happen in about a tenth of a second, even while the brain is asleep. Anything else goes to the brain, which can use the same actions. Opening things, sound, music, timers and notes just happen. Clearing the list or deleting a note or routine shows a Yes/No card first. "Play X on Spotify" looks the song up online (when Web is on) to start the exact track; offline it opens the search in Spotify.
+
 ## Voice
 
 Press **Call** in the app and just talk, like a phone call. NUBB-E answers out loud when you pause, then listens again. Talk over it to interrupt. Press **End call** to hang up. Each call is saved as one "Call:" chat.

@@ -16,5 +16,12 @@ soundfile
 onnx-asr[hub]      # Parakeet ears (speech to text), about 4x faster than Whisper on the CPU
 piper-tts          # optional backup voice
 
+# Everyday actions (Windows): what's playing and play/pause/next for any player. Optional: without
+# them NUBB-E presses the media keys instead and can't say what's playing.
+winrt-runtime
+winrt-Windows.Media.Control
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
+
 # tests only
 pytest

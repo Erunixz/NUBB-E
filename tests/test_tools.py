@@ -144,8 +144,8 @@ def test_notes_question_uses_search_and_answers_from_the_file(base, fake, ws, da
     assert "confirm" not in [e["type"] for e in events]          # reading needs no Yes
     assert "stronger servo" in reply_of(events)
     first, second = chat_requests(fake)[-2:]
-    assert [t["function"]["name"] for t in first["tools"]] == ["list_dir", "read_file", "search_files",
-                                                                "write_file", "run_command"]
+    assert [t["function"]["name"] for t in first["tools"]][:5] == ["list_dir", "read_file", "search_files",
+                                                                    "write_file", "run_command"]
     assert "Your file tools" in first["messages"][0]["content"]
     call = second["messages"][-2]["tool_calls"][0]
     assert call["function"]["name"] == "search_files" and json.loads(call["function"]["arguments"]) == {"query": "servo"}
@@ -238,12 +238,14 @@ def test_tool_rounds_are_limited(base, fake, ws):
 
 def test_no_tools_in_voice_or_without_a_workspace(base, fake, ws, monkeypatch):
     fake.plan = [("list_dir", {})]
+    file_tools = {s["function"]["name"] for s in tools.SCHEMAS}
+    offered = lambda: {t["function"]["name"] for t in chat_requests(fake)[-1].get("tools") or []}   # noqa: E731
     chat_answering(base, "Hi on a call", voice=True, source="call")
-    assert "tools" not in chat_requests(fake)[-1]
+    assert not offered() & file_tools                          # everyday actions only (Phase 6.7c)
     assert "Your file tools" not in chat_requests(fake)[-1]["messages"][0]["content"]
     monkeypatch.setattr(tools, "WORKSPACE_DIR", "")
     chat_answering(base, "Hi")
-    assert "tools" not in chat_requests(fake)[-1]
+    assert not offered() & file_tools
 
 
 # ---------------------------------------------------------------------------

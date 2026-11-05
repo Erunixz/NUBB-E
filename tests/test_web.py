@@ -91,7 +91,9 @@ def tool_results(fake):
 
 
 def offered(request):
-    return [t["function"]["name"] for t in request.get("tools", [])]
+    """Tools offered besides the everyday actions (those are always there since Phase 6.7c)."""
+    import nubbe_actions
+    return [t["function"]["name"] for t in request.get("tools", []) if t["function"]["name"] not in nubbe_actions.TOOLS]
 
 
 # ---------------------------------------------------------------------------

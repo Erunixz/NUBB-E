@@ -299,7 +299,7 @@ class Cues:
     Any other sentence is made fresh as before. Changing the voice or speed makes a new set."""
     LINES = ("Let me look that up.", "Let me read that.", "Let me look at the form.", "Let me find it.",
              "One sec.", "Let me look.", "On it.", "Okay, I won't.", "Still on it, one sec.",
-             "Waking up, one sec.", "Yes?")
+             "Waking up, one sec.", "Yes?", "Time's up! Your timer is done.")
     DIR = Path.home() / ".nubbe" / "cues"
 
     def __init__(self):
@@ -1105,7 +1105,8 @@ def serve(stt, st: dict, speak_q, threshold: float) -> None:
     call   = start a hands-free call.   hangup = end it.
     listen = push-to-talk turn, or stop recording early if already listening.
     stop   = stop listening / stop talking (ends a call too).   quit = exit.
-    wake_on / wake_off = listen for "Hey NUBB-E" in between (paused during a call or a push-to-talk turn)."""
+    wake_on / wake_off = listen for "Hey NUBB-E" in between (paused during a call or a push-to-talk turn).
+    say <text> = say this out loud now (timers and reminders)."""
     stop = threading.Event()
     busy = threading.Event()
     call: list[Call] = []
@@ -1143,6 +1144,11 @@ def serve(stt, st: dict, speak_q, threshold: float) -> None:
         cmd = line.strip()
         if cmd == "quit":
             break
+        if cmd.startswith("say "):        # the app announces something (a timer or reminder that's due)
+            if not GENERATING.is_set():
+                HUSH.clear()
+            speak_q.put(cmd[4:])
+            continue
         if call and call[0].done.is_set():
             call.clear()                  # the last call ended by itself (e.g. mic problem)
         if wake and wake[0].done.is_set():

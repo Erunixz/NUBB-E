@@ -55,6 +55,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from contextlib import closing, contextmanager
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -78,6 +79,8 @@ from nubbe_quick import QUICK_PAGE            # quick bar page (keep nubbe_quick
 import nubbe_tools as tools                   # file tools, only inside workspace_dir (keep next to this file)
 import nubbe_web as web                       # web search and page reading, only when online (keep next to this file)
 import nubbe_hands as hands                   # fills in forms on screen after a Yes (keep next to this file)
+import nubbe_actions as actions               # apps, volume, music, timers, reminders, the list, notes, routines
+import nubbe_desk as desk                     # the Windows side of those actions
 
 VOICE_RULES = (
     "\n\n## Voice call\n"
@@ -170,7 +173,8 @@ def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB_PATH, timeout=10)) as con, con:
         con.executescript(SCHEMA)
-        cols = {r[1] for r in con.execute("PRAGMA table_info(chats)")}
+        con.executescript(actions.SCHEMA)     # to-dos, notes, timers and reminders, routines
+        cols ={r[1] for r in con.execute("PRAGMA table_info(chats)")}
         if "summary" not in cols:   # added later: a short running summary of each chat
             con.execute("ALTER TABLE chats ADD COLUMN summary TEXT")
             con.execute("ALTER TABLE chats ADD COLUMN summary_n INTEGER DEFAULT 0")
@@ -181,6 +185,39 @@ def init_db() -> None:
 
 def get_settings() -> dict:
     return {r["key"]: r["value"] == "1" for r in rows("SELECT key, value FROM settings")}
+
+
+def web_allowed() -> bool:
+    """The Web switch is on (and web_enabled in config.toml) and there's internet."""
+    return web.ENABLED and get_settings().get("web", False) and web.online()
+
+
+def action_search(query: str) -> str | None:
+    """Web search for actions (finding a song on Spotify). None when the web is off or offline."""
+    return web.call("web_search", {"query": query}, DATA_DIR / "web.log") if web_allowed() else None
+
+
+def action_weather() -> str | None:
+    """Today's weather for the good-morning briefing (wttr.in guesses the place from the internet
+    connection). Only when the web is on and online; logged in web.log like any page."""
+    if not web_allowed():
+        return None
+    url = "https://wttr.in/?format=%C,+%t"
+    try:   # a plain client name: wttr.in sends a whole web page to browsers, one line to command-line tools
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0"})
+        with urllib.request.urlopen(req, timeout=web.TIMEOUT) as r:
+            text = r.read(500).decode("utf-8", "replace")
+        web.log(DATA_DIR / "web.log", "read_page", {"url": url}, "ok")
+    except Exception as e:
+        web.log(DATA_DIR / "web.log", "read_page", {"url": url}, f"error: {e}")
+        return None
+    text = " ".join(text.replace(" ,", ",").split())
+    return text if 0 < len(text) < 60 and "<" not in text else None
+
+
+ACTIONS = actions.Actions(lambda: connect(), web_search=action_search, weather=action_weather)
+LIST_ACTIONS = {"add_todo", "done_todo", "clear_todos", "add_note", "delete_note", "set_timer", "set_reminder",
+                "cancel_reminder", "make_routine", "delete_routine"}
 
 
 def title_from(text: str) -> str:
@@ -378,11 +415,13 @@ def setup(slot: int, chat_id=None) -> tuple[str, list | None]:
     net = switched_on and web.online()     # a local check, cached: normal chats never touch the network
     files = slot == CHAT_SLOT and tools.root() is not None
     system = system_prompt(chat_id) + (tools.rules() if files else "") + web.rules(switched_on, net, slot == VOICE_SLOT)
+    system += actions.RULES
     if HANDS:
         system += hands.RULES
     if slot == VOICE_SLOT:
         system += VOICE_RULES
-    offered = (tools.SCHEMAS if files else []) + (web.SCHEMAS if net else []) + ([hands.SCHEMA, hands.CLICK_SCHEMA] if HANDS else [])
+    offered = ((tools.SCHEMAS if files else []) + (web.SCHEMAS if net else []) + actions.SCHEMAS
+               + ([hands.SCHEMA, hands.CLICK_SCHEMA] if HANDS else []))
     return system, offered or None
 
 
@@ -429,7 +468,7 @@ class Voice:
                 self.in_call = False
             if self.proc is None or self.proc.poll() is not None:
                 self.in_call = self.in_call and cmd == "call"
-                if cmd not in ("listen", "call", "wake_on"):
+                if cmd not in ("listen", "call", "wake_on") and not cmd.startswith("say "):
                     return "off"
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
                 if self.log:
@@ -444,7 +483,7 @@ class Voice:
                 status = "starting"
                 if self.wake:     # "Hey NUBB-E" listening comes back on whenever the helper restarts
                     self.proc.stdin.write("wake_on\n")
-                if cmd != "wake_on":
+                if cmd in ("call", "listen"):
                     broadcast({"state": "thinking", "status": "connecting..."})
                 if llm_alive():   # get the brain's voice slot ready while the speech models load
                     threading.Thread(target=warm_slot, args=(VOICE_SLOT,),
@@ -476,6 +515,49 @@ class Voice:
 
 VOICE = Voice()
 BRAIN.busy = lambda: VOICE.in_call
+
+
+def fire_reminder(r: dict) -> None:
+    """A timer or reminder is due: NUBB-E says it out loud, the face reacts, a Windows notification
+    shows (even with no NUBB-E window open), and the app window and quick bar show it too."""
+    if r["kind"] == "timer":
+        msg = f"Your {r['text']} timer is done!" if r["text"] else "Time's up! Your timer is done."
+    else:
+        what = actions._you(r["text"])
+        msg = (f"You missed a reminder while I was off: {what}." if r.get("late") else f"Reminder: {what}.")
+    print(msg)
+    broadcast({"event": "reminder", "text": msg})
+    broadcast({"event": "lists"})
+    broadcast({"state": "surprised", "status": "reminder"})
+    desk.notify("NUBB-E", msg)
+    try:
+        VOICE.send("say " + " ".join(msg.split()))
+    except OSError:
+        pass
+
+
+def watch_reminders() -> None:
+    while True:
+        time.sleep(1)
+        try:
+            due = ACTIONS.due()
+        except sqlite3.Error:
+            continue
+        for r in due:
+            try:
+                fire_reminder(r)
+            except Exception as e:      # one broken reminder never stops the others
+                print(f"Couldn't announce a reminder: {e}")
+
+
+def lists_now() -> dict:
+    """Everything the Lists panel shows."""
+    return {"todos": rows("SELECT id, text, done FROM todos WHERE done = 0 OR done_at > ? ORDER BY done, id",
+                          (time.time() - 86400,)),
+            "notes": rows("SELECT id, text, created FROM notes ORDER BY id DESC LIMIT 100"),
+            "reminders": [{**r, "left": r["due"] - time.time(),
+                           "when": actions.say_time(datetime.fromtimestamp(r["due"]))}
+                          for r in rows("SELECT id, text, due, kind FROM reminders WHERE fired = 0 ORDER BY due")]}
 
 
 def system_prompt(chat_id=None) -> str:
@@ -728,6 +810,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(CURRENT)
         elif path == "/api/voice":
             self.send_json({"in_call": VOICE.in_call})
+        elif path == "/api/lists":
+            self.send_json(lists_now())
+        elif path == "/api/media":       # what's playing, for the quick bar
+            self.send_json(desk.now_playing() or {})
         elif path == "/api/confirm":     # the voice helper asks: is a card waiting for a spoken yes or no?
             self.send_json({"voice_pending": any(c.get("voice") for c in PENDING.values())})
         else:
@@ -758,6 +844,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(CURRENT)
         elif path == "/api/look":
             self.chat(body, look=True)
+        elif path == "/api/lists":        # the Lists panel: Erfan clicked something himself
+            self.lists_action(body)
+        elif path == "/api/media":        # the quick bar's music buttons
+            try:
+                self.send_json({"text": desk.media(str(body.get("action", "")))})
+            except desk.DeskError as e:
+                self.send_json({"text": str(e)}, 400)
         elif path == "/api/wake":         # Erfan started typing: load the brain now if it's asleep
             self.send_json({"state": BRAIN.wake()})
         elif path == "/api/show":         # NUBB-E was started a second time: show this copy instead
@@ -810,6 +903,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({**get_settings(), "web_allowed": web.ENABLED})
         else:
             self.send_error(404)
+
+    def lists_action(self, body: dict) -> None:
+        """Clicks in the Lists panel. These are Erfan's own clicks (the page asks before deleting a note),
+        so no Yes card."""
+        action, item_id = body.get("action"), body.get("id")
+        if action == "add_todo" and str(body.get("text", "")).strip():
+            ACTIONS.call("add_todo", {"item": str(body["text"])[:200]})
+        elif action == "add_note" and str(body.get("text", "")).strip():
+            ACTIONS.call("add_note", {"text": str(body["text"])})
+        elif action in ("done_todo", "undo_todo") and isinstance(item_id, int):
+            run("UPDATE todos SET done = ?, done_at = ? WHERE id = ?", (int(action == "done_todo"), time.time(), item_id))
+        elif action == "delete_todo" and isinstance(item_id, int):
+            run("DELETE FROM todos WHERE id = ?", (item_id,))
+        elif action == "delete_note" and isinstance(item_id, int):
+            run("DELETE FROM notes WHERE id = ?", (item_id,))
+        elif action == "cancel_reminder" and isinstance(item_id, int):
+            run("DELETE FROM reminders WHERE id = ? AND fired = 0", (item_id,))
+        else:
+            self.send_error(400)
+            return
+        broadcast({"event": "lists"})
+        self.send_json(lists_now())
 
     def events(self):
         self.start_stream()
@@ -880,6 +995,14 @@ class Handler(BaseHTTPRequestHandler):
                                              f"if I ask what's on it.) {asked}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{shot['image']}"}}]
             del h["id"]
+        try:   # rules first: "open calculator", "timer 10 minutes" run right away, no brain needed
+            steps = None if look else ACTIONS.plan(text)
+        except Exception as e:
+            print(f"Couldn't read that as a quick command ({e}); asking the brain.")
+            steps = None
+        if steps:
+            self.quick_reply(chat_id, steps)
+            return
         slot = VOICE_SLOT if voice else CHAT_SLOT
         system, offered = setup(slot, chat_id)
         messages = [{"role": "system", "content": system}] + history
@@ -910,6 +1033,8 @@ class Handler(BaseHTTPRequestHandler):
                     calls, said = [], ""
                     if offered and not web.online():     # the internet dropped mid-reply: no more retrying
                         offered = [t for t in offered if t["function"]["name"] not in web.TOOLS] or None
+                    # only tools offered this round may run (not web search after the internet dropped)
+                    self.offered_now = {t["function"]["name"] for t in (offered or [])} if rnd < MAX_TOOL_ROUNDS else set()
                     if fast and rnd == 0:
                         calls = [{"id": "call_hands", "type": "function", "function": {
                             "name": fast, "arguments": json.dumps({"request": text, "target": text})}}]
@@ -965,6 +1090,42 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=learn_from, args=(chat_id, text, reply, settings["auto_memory"] and not look),
                                  daemon=True).start()
 
+    def quick_reply(self, chat_id: int, steps: list) -> None:
+        """Runs a simple command's actions and says what happened, without the brain. Saved like any
+        reply; commands aren't facts about Erfan, so nothing is learned from them."""
+        self.start_stream()
+        reply = ""
+        try:
+            self.emit({"type": "start", "chat_id": chat_id})
+            for name, args in steps:
+                val = (" " if reply else "") + self.run_action(name, args)
+                reply += val
+                self.emit({"type": "delta", "text": val})
+            self.emit({"type": "done"})
+        except OSError:
+            pass   # window closed: the actions still ran, and the reply is still saved
+        finally:
+            if reply:
+                try:
+                    run("INSERT INTO messages(chat_id, role, content, created) VALUES (?, 'assistant', ?, ?)",
+                        (chat_id, reply, time.time()))
+                    run("UPDATE chats SET updated = ? WHERE id = ?", (time.time(), chat_id))
+                except sqlite3.Error as e:
+                    print(f"Couldn't save the reply: {e}")
+                broadcast({"event": "chat", "chat_id": chat_id, "current": CURRENT["chat_id"] == chat_id})
+            broadcast({"state": "happy", "status": ""})
+
+    def run_action(self, name: str, args: dict) -> str:
+        """One everyday action (from a quick command or the brain). Harmless ones just run; clearing the
+        list or deleting a note or routine waits for Erfan's Yes. Logged in tools.log."""
+        approved = self.ask_yes(ACTIONS.card(name, args)) if name in actions.ASK_FIRST else None
+        result = ACTIONS.call(name, args, approved)
+        tools.log(DATA_DIR / "tools.log", name, {k: v for k, v in args.items() if k != "text"},
+                  result[:120].replace("\n", " "))
+        if name in LIST_ACTIONS:
+            broadcast({"event": "lists"})   # the Lists panel shows it right away
+        return result
+
     def use_tool(self, c: dict) -> str:
         """Runs one tool call from the model. Anything that changes files or runs a command waits for
         Erfan's Yes on a card in the chat; no answer, a closed window or a timeout all count as No."""
@@ -976,12 +1137,21 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             tools.log(DATA_DIR / "tools.log", name, {}, "error: arguments weren't valid JSON")
             return "Your tool arguments weren't valid JSON. Try again."
+        known = set(web.TOOLS) | set(hands.TOOLS) | set(tools.TOOLS) | actions.TOOLS
+        if name in known and name not in getattr(self, "offered_now", known):
+            # a real tool that wasn't offered this round: web search after the internet dropped,
+            # file tools on a voice call, hands with vision off
+            tools.log(DATA_DIR / "tools.log", name, {}, "not offered")
+            return f"{name} isn't available right now."
         line = (web.status(name, args) if name in web.TOOLS else "looking at the form" if name == "fill_form"
-                else "looking for it on the screen" if name == "click_on" else tools.status(name, args))
+                else "looking for it on the screen" if name == "click_on"
+                else actions.status(name, args) if name in actions.TOOLS else tools.status(name, args))
         self.emit({"type": "tool", "name": name, "text": line})
         broadcast({"state": "thinking", "status": line[:60]})
         if name in web.TOOLS:   # read-only, so no card; only the search words or the link go online
             return web.call(name, args, DATA_DIR / "web.log")
+        if name in actions.TOOLS:
+            return self.run_action(name, args)
         if name in hands.TOOLS:
             if not HANDS:
                 return "Using the screen needs vision (mmproj in config.toml) on Windows."
@@ -1238,6 +1408,8 @@ def main() -> None:
         with BRAIN.lock:
             BRAIN.start()
     threading.Thread(target=BRAIN.watch_idle, daemon=True).start()
+    threading.Thread(target=watch_reminders, daemon=True).start()   # timers and reminders, even in the background
+    desk.warm_up()                                                  # read the Start menu once, so "open X" is instant
     if str(CFG["voice"].get("wake_phrase", False)).lower() in ("true", "1", "yes", "on"):
         print('Listening for "Hey NUBB-E" (wake_phrase in config.toml).')
         threading.Thread(target=VOICE.send, args=("wake_on",), daemon=True).start()
@@ -1359,6 +1531,20 @@ PAGE = r"""<!doctype html>
   .mem-add input { flex: 1; padding: 8px 10px; border-radius: 8px; background: var(--bg); color: var(--text);
                    border: 1px solid var(--line); font: inherit; }
   .row { display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-size: 13px; }
+
+  /* lists panel: timers and reminders, to-do, notes */
+  #listPanel { position: fixed; inset: 0; background: #0009; display: none; align-items: center; justify-content: center; }
+  #listPanel.open { display: flex; }
+  #listPanel .mem-card { overflow-y: auto; }
+  .list-sec h3 { margin: 6px 0 6px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .item { display: flex; gap: 8px; align-items: center; padding: 6px 10px; border-radius: 8px; background: #16202a; margin-bottom: 5px; }
+  .item span { flex: 1; white-space: pre-wrap; }
+  .item small { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .item.done span { text-decoration: line-through; color: var(--muted); }
+  .item button { color: var(--muted); }
+  .item button:hover { color: #ff8a8a; }
+  .item input[type=checkbox] { accent-color: var(--glow); }
+  .msg.reminder { align-self: center; border: 1px solid var(--glow); color: var(--glow); border-radius: 12px; padding: 8px 14px; }
 </style>
 </head>
 <body>
@@ -1366,6 +1552,7 @@ PAGE = r"""<!doctype html>
   <div class="brand">NUBB-E</div>
   <button class="side-btn" id="newChat">+ New chat</button>
   <button class="side-btn" id="openMem">Memory</button>
+  <button class="side-btn" id="openLists">Lists</button>
   <div id="chats"></div>
   <div class="side-foot"><span class="dot" id="brainDot"></span><span id="brainText">brain loading...</span></div>
 </aside>
@@ -1392,6 +1579,21 @@ PAGE = r"""<!doctype html>
     <div class="mem-add"><input id="memInput" placeholder="Add something, e.g. I prefer Python over Java">
       <button class="send" id="memAdd">Add</button></div>
     <div id="memList"></div>
+  </div>
+</div>
+
+<div id="listPanel">
+  <div class="mem-card">
+    <div class="row"><h2>Lists</h2><button id="closeLists">Close</button></div>
+    <p>Say things like "timer 10 minutes", "remind me at 6 to call mom", "add milk to my list" or
+       "take a note: ...". Stored only on this PC.</p>
+    <div class="list-sec"><h3>Timers and reminders</h3><div id="remList"></div></div>
+    <div class="list-sec"><h3>To-do</h3>
+      <div class="mem-add"><input id="todoInput" placeholder="Add to your list"><button class="send" id="todoAdd">Add</button></div>
+      <div id="todoList" style="margin-top:8px"></div></div>
+    <div class="list-sec"><h3>Notes</h3>
+      <div class="mem-add"><input id="noteInput" placeholder="Write a note, or type to search them"><button class="send" id="noteAdd">Save</button></div>
+      <div id="noteList" style="margin-top:8px"></div></div>
   </div>
 </div>
 
@@ -1632,6 +1834,52 @@ async function addMem() { const v = $('memInput').value.trim(); if (v) { await a
 $('memAdd').onclick = addMem;
 $('memInput').addEventListener('keydown', e => { if (e.key === 'Enter') addMem(); });
 
+// lists panel: timers and reminders, the to-do list and quick notes
+let lists = { todos: [], notes: [], reminders: [] };
+function itemEl(text, small, buttons) {
+  const el = document.createElement('div'); el.className = 'item';
+  el.innerHTML = '<span></span>' + (small ? '<small></small>' : '');
+  el.querySelector('span').textContent = text;
+  if (small) el.querySelector('small').textContent = small;
+  for (const [label, title, fn] of buttons) {
+    const b = document.createElement('button'); b.innerHTML = label; b.title = title; b.onclick = fn; el.appendChild(b);
+  }
+  return el;
+}
+const listDo = async body => { lists = await api('/api/lists', body); drawLists(); };
+function left(secs) { secs = Math.max(0, Math.round(secs)); const m = Math.floor(secs / 60), s = secs % 60;
+  return m >= 60 ? Math.floor(m / 60) + ' h ' + (m % 60) + ' min left' : m ? m + ' min ' + s + ' s left' : s + ' s left'; }
+function drawLists() {
+  const rem = $('remList'); rem.innerHTML = lists.reminders.length ? '' : '<p>None set.</p>';
+  for (const r of lists.reminders)
+    rem.appendChild(itemEl(r.kind === 'timer' ? 'Timer' + (r.text ? ': ' + r.text : '') : r.text,
+      r.kind === 'timer' ? left(r.due - Date.now() / 1000) : r.when,
+      [['&times;', 'Cancel', () => listDo({ action: 'cancel_reminder', id: r.id })]]));
+  const todo = $('todoList'); todo.innerHTML = lists.todos.length ? '' : '<p>Your list is empty.</p>';
+  for (const t of lists.todos) {
+    const el = itemEl(t.text, '', [['&times;', 'Remove', () => listDo({ action: 'delete_todo', id: t.id })]]);
+    const box = document.createElement('input'); box.type = 'checkbox'; box.checked = !!t.done;
+    box.onchange = () => listDo({ action: box.checked ? 'done_todo' : 'undo_todo', id: t.id });
+    el.prepend(box); el.classList.toggle('done', !!t.done); todo.appendChild(el);
+  }
+  const q = $('noteInput').value.trim().toLowerCase(), notes = $('noteList');
+  const shown = lists.notes.filter(n => !q || n.text.toLowerCase().includes(q));
+  notes.innerHTML = shown.length ? '' : '<p>' + (q ? 'No notes match.' : 'No notes yet.') + '</p>';
+  for (const n of shown)
+    notes.appendChild(itemEl(n.text, new Date(n.created * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+      [['&times;', 'Delete', () => { if (confirm('Delete this note?')) listDo({ action: 'delete_note', id: n.id }); }]]));
+}
+async function loadLists() { lists = await api('/api/lists'); drawLists(); }
+$('openLists').onclick = () => { $('listPanel').classList.add('open'); loadLists(); };
+$('closeLists').onclick = () => $('listPanel').classList.remove('open');
+$('listPanel').onclick = e => { if (e.target.id === 'listPanel') $('listPanel').classList.remove('open'); };
+const addTodo = () => { const v = $('todoInput').value.trim(); if (v) { $('todoInput').value = ''; listDo({ action: 'add_todo', text: v }); } };
+const addNote = () => { const v = $('noteInput').value.trim(); if (v) { $('noteInput').value = ''; listDo({ action: 'add_note', text: v }); } };
+$('todoAdd').onclick = addTodo; $('todoInput').addEventListener('keydown', e => { if (e.key === 'Enter') addTodo(); });
+$('noteAdd').onclick = addNote; $('noteInput').addEventListener('keydown', e => { if (e.key === 'Enter') addNote(); });
+$('noteInput').addEventListener('input', drawLists);
+setInterval(() => { if ($('listPanel').classList.contains('open') && lists.reminders.length) drawLists(); }, 1000);
+
 // brain status: face sleeps until the model is loaded, and while it naps after idle time
 const BRAIN_TEXT = { online: 'brain online (offline mode)', loading: 'brain loading...',
                      asleep: 'brain asleep, wakes when you write', offline: 'brain offline' };
@@ -1650,6 +1898,8 @@ const es = new EventSource('/events');
 es.onmessage = e => {
   const d = JSON.parse(e.data);
   if (d.event === 'memory' && $('memPanel').classList.contains('open')) loadMemory();
+  if (d.event === 'lists' && $('listPanel').classList.contains('open')) loadLists();
+  if (d.event === 'reminder') { bubble('reminder', '⏰ ' + d.text); setFace('surprised'); }
   // a reply finished somewhere (here, the quick bar, or a call): show it if it's the chat we're on,
   // or switch to it when the quick bar continued the current chat
   if (d.event === 'chat' && !busy) { if (chatId === d.chat_id || d.current) openChat(d.chat_id); else loadChats(); }
