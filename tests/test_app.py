@@ -758,3 +758,22 @@ def test_second_copy_cannot_share_the_port():
             app.AppServer(("127.0.0.1", first.server_address[1]), app.Handler)
     finally:
         first.server_close()
+
+
+def test_wake_phrase_starts_the_voice_helper_listening(monkeypatch, data_dir):
+    sent = []
+
+    class Proc:
+        stdin = type("In", (), {"write": lambda self, s: sent.append(s.strip()), "flush": lambda self: None})()
+
+        def poll(self):
+            return None
+    monkeypatch.setattr(app.subprocess, "Popen", lambda *a, **k: Proc())
+    monkeypatch.setattr(app, "tie_to_app", lambda p: None)
+    monkeypatch.setattr(app, "BRAIN", type("B", (), {"wake": lambda self: sent.append("(brain woken)")})())
+    v = app.Voice()
+    assert v.send("wake_on") == "starting"
+    assert "wake_on" in sent and "(brain woken)" not in sent   # listening alone doesn't load the brain
+    assert v.in_call is False
+    v.send("wake_off")
+    assert sent[-1] == "wake_off" and v.wake is False

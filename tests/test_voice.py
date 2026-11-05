@@ -18,8 +18,11 @@ import nubbe_voice as voice
 def quiet_face(monkeypatch):
     """The face lives in the real app: never talk to it from tests."""
     monkeypatch.setattr(voice, "set_face", lambda *a, **k: None)
-    voice.GENERATING.clear(), voice.SPEAKING.clear(), voice.HUSH.clear()
+    voice.GENERATING.clear(), voice.SPEAKING.clear(), voice.HUSH.clear(), voice.IN_CALL.clear()
     voice.PLAYER.clear()
+    voice.RECENT_SPEECH.clear()
+    voice.REPLY_SO_FAR[0] = ""
+    monkeypatch.setattr(voice, "new_detector", lambda: None)   # tests that want one give their own
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +52,17 @@ def test_spoken_answers(text, yes, no, still):
 # ---------------------------------------------------------------------------
 # the listen loop: background sound (a video) vs Erfan talking
 # ---------------------------------------------------------------------------
-def run_call(levels, playing):
+def run_call(levels, playing, speechy=None):
     """Feeds 0.1 s mic blocks at these loudness levels; playing[i]: another app plays sound then.
+    speechy[i]: what the voice detector says about block i (none given: loudness only).
     Returns the length (seconds) of each turn the call would answer."""
     call = voice.Call(None, {}, queue.Queue(), threshold=0.001)
     turns, state = [], {"i": -1}
+
+    class Detector:
+        def prob(self, block):
+            return speechy[state["i"]]
+    call.vad = Detector() if speechy else None
 
     class Blocks:
         def get(self, timeout=None):
@@ -254,3 +263,162 @@ def test_waking_up_is_said_once(monkeypatch):
     voice.stream_reply("hello", st, q)
     assert [q.get_nowait() for _ in range(q.qsize())] == ["Waking up, one sec.", "Hi there."]
     assert st["chat_id"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.7b: voice detection, Parakeet ears, NUBB-E's name, "Hey NUBB-E"
+# ---------------------------------------------------------------------------
+def test_voice_detector_ignores_noise():
+    """The real Silero model (ships inside faster-whisper): fans, clicks and beeps aren't speech."""
+    rng = np.random.default_rng(0)
+    clicks = np.zeros(16000, np.float32)
+    clicks[::1600], clicks[1::1600] = 0.5, -0.4
+    sounds = {"silence": np.zeros(16000, np.float32), "fan": rng.normal(0, 0.01, 16000).astype(np.float32),
+              "clicks": clicks, "beep": (0.05 * np.sin(2 * np.pi * 440 * np.arange(16000) / 16000)).astype(np.float32)}
+    for name, audio in sounds.items():
+        d = voice.SpeechDetector()
+        probs = [d.prob(audio[i:i + 1600]) for i in range(0, 16000, 1600)]   # 100 ms blocks, like a call
+        assert max(probs) < voice.VAD_ON, name
+
+
+def test_voice_detector_takes_any_block_size():
+    d = voice.SpeechDetector()
+    for size in (100, 1600, 700, 3000):          # not multiples of its 512-sample window
+        assert 0.0 <= d.prob(np.zeros(size, np.float32)) <= 1.0
+    assert len(d.buf) < voice.SpeechDetector.WINDOW
+
+
+def test_loud_noise_is_not_a_turn():
+    levels = [0.05] * 30                          # a loud fan right next to the mic
+    assert run_call(levels, [False] * 30, speechy=[0.05] * 30) == []
+
+
+def test_speech_turn_with_voice_detection():
+    levels = [0.0005] * 5 + [0.05] * 10 + [0.0005] * 10
+    speechy = [0.0] * 5 + [0.95] * 10 + [0.02] * 10
+    turns = run_call(levels, [False] * 25, speechy)
+    assert len(turns) == 1 and 1.0 <= turns[0] <= 2.0
+
+
+def test_sentence_ends_even_with_a_fan_on():
+    """Loudness alone would wait for the 20 s limit with a fan running; the detector hears him stop."""
+    levels = [0.02] * 5 + [0.06] * 10 + [0.02] * 30
+    speechy = [0.02] * 5 + [0.95] * 10 + [0.03] * 30
+    turns = run_call(levels, [False] * 45, speechy)
+    assert len(turns) == 1 and turns[0] < 2.5
+
+
+@pytest.mark.parametrize("heard, fixed", [
+    ("Hey newbie, what's the weather like today?", "Hey NUBB-E, what's the weather like today?"),
+    ("Hey noobie", "Hey NUBB-E"), ("Hey Nuby, what's up?", "Hey NUBB-E, what's up?"),
+    ("Hey NUBB!", "Hey NUBB-E!"), ("Hey NUBB-E.", "Hey NUBB-E."), ("Thanks nubby.", "Thanks NUBB-E."),
+    ("I'm a newbie at Rust.", "I'm a newbie at Rust."),          # the real word stays
+    ("Newbie, open Spotify.", "NUBB-E, open Spotify."),
+])
+def test_names_are_fixed(heard, fixed):
+    assert voice.fix_names(heard) == fixed
+
+
+@pytest.mark.parametrize("text, rest", [
+    ("Hey NUBB-E, what's the time?", "what's the time?"), ("Hey NUBB-E.", ""), ("NUBB-E, open Spotify", "open Spotify"),
+    ("Okay NUBB-E what's up", "what's up"), ("What's up?", None), ("I told NUBB-E about it", None),
+    ("Hey, can you help?", None),
+])
+def test_wake_phrase(text, rest):
+    assert voice.wake_rest(text) == rest
+
+
+def test_parakeet_ears_fix_the_name():
+    ears = voice.Parakeet.__new__(voice.Parakeet)
+    ears.model = type("M", (), {"recognize": lambda self, audio, sample_rate: "Hey newbie, open Calculator."})()
+    assert voice.transcribe(ears, np.full(1600, 0.1, np.float32)) == "Hey NUBB-E, open Calculator."
+
+
+def test_ears_fall_back_to_whisper(monkeypatch):
+    class Broken:
+        def __init__(self):
+            raise ImportError("no onnx_asr")
+    monkeypatch.setattr(voice, "Parakeet", Broken)
+    monkeypatch.setattr(voice, "WhisperModel", lambda *a, **k: "whisper")
+    args = type("A", (), {"ears": "parakeet", "whisper": "base.en"})()
+    assert voice.load_ears(args) == "whisper"
+    args.ears = "whisper"
+    assert voice.load_ears(args) == "whisper"
+
+
+@pytest.fixture
+def wake_call(monkeypatch):
+    c = voice.Call(None, {"chat_id": 7, "use_app": True}, queue.Queue(), threshold=0.001, wake=True)
+    started = []
+    monkeypatch.setattr(voice, "stream_reply", lambda *a, **k: started.append(a[0]))
+    monkeypatch.setattr(voice, "tell_app_to_wake", lambda: started.append("(app wakes the brain)"))
+    c.started = started
+    return c
+
+
+def test_wake_mode_ignores_other_talk(wake_call, monkeypatch, capsys):
+    said(wake_call, monkeypatch, "So I told him the password is pancakes.", barged=False)
+    assert wake_call.started == [] and spoken(wake_call.speak_q) == []
+    assert "pancakes" not in capsys.readouterr().out          # never printed (or saved anywhere)
+    assert not wake_call.awake()
+
+
+def test_wake_mode_answers_after_the_name(wake_call, monkeypatch):
+    said(wake_call, monkeypatch, "Hey NUBB-E, what's the time?", barged=False)
+    assert wake_call.started[-1] == "what's the time?" and "(app wakes the brain)" in wake_call.started
+    assert wake_call.awake() and wake_call.st["chat_id"] is None     # a new session is a new chat
+    said(wake_call, monkeypatch, "And in Tokyo?", barged=False)      # a follow-up needs no name
+    assert wake_call.started[-1] == "And in Tokyo?"
+
+
+def test_wake_mode_just_the_name_asks_back(wake_call, monkeypatch):
+    said(wake_call, monkeypatch, "Hey NUBB-E.", barged=False)
+    assert spoken(wake_call.speak_q) == ["Yes?"] and wake_call.awake()
+    said(wake_call, monkeypatch, "Open my notes.", barged=False)
+    assert wake_call.started[-1] == "Open my notes."
+
+
+def test_wake_session_ends_after_the_follow_up_time(wake_call, monkeypatch):
+    said(wake_call, monkeypatch, "Hey NUBB-E, hi!", barged=False)
+    wake_call.awake_until = voice.time.time() - 0.1      # follow-up time is over
+    wake_call._wake_session_tick()
+    assert not wake_call.awake() and not voice.IN_CALL.is_set()
+    said(wake_call, monkeypatch, "What about now?", barged=False)
+    assert wake_call.started[-1] == "hi!"                # not answered: needs the name again
+
+
+def test_wake_session_has_a_hard_limit(wake_call, monkeypatch):
+    """A TV talking non-stop can't keep the session open forever."""
+    said(wake_call, monkeypatch, "Hey NUBB-E, tell me a story.", barged=False)
+    voice.SPEAKING.set()                                 # NUBB-E keeps talking...
+    wake_call.session_end = voice.time.time() - 0.1      # ...past the hard limit
+    wake_call._wake_session_tick()
+    assert not wake_call.awake()
+
+
+def test_own_short_cue_is_echo():
+    voice.RECENT_SPEECH.append("Yes?")
+    assert voice.Call._is_own_echo("Yes.")
+    assert not voice.Call._is_own_echo("No.")
+
+
+def test_serve_pauses_wake_listening_for_a_call(monkeypatch):
+    import io
+    made = []
+
+    class FakeCall:
+        def __init__(self, stt, st, q, threshold, wake=False):
+            self.wake, self.hangup, self.done = wake, threading.Event(), threading.Event()
+            made.append(self)
+
+        def run(self):
+            self.hangup.wait(5)
+            self.done.set()
+
+        def hang_up(self):
+            self.hangup.set()
+    monkeypatch.setattr(voice, "Call", FakeCall)
+    monkeypatch.setattr(voice.sys, "stdin", io.StringIO("wake_on\ncall\nhangup\nwake_off\nquit\n"))
+    voice.serve(None, {}, queue.Queue(), 0.001)
+    assert [c.wake for c in made] == [True, False, True]       # wake, then the call, then wake again
+    assert all(c.hangup.is_set() for c in made)                 # nothing left holding the mic

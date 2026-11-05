@@ -95,11 +95,61 @@ VOICE_RULES = (
 
 
 # ---------- listening ----------
+VAD_ON, VAD_OFF = 0.5, 0.3   # speech chance that starts a turn / that keeps it going
+
+
+class SpeechDetector:
+    """Silero VAD (MIT), the copy that ships inside faster-whisper, run on the mic as it streams.
+    About 0.25 ms per 100 ms of audio. It tells real speech from fans, clicks, beeps and music,
+    which the loudness threshold alone can't. One per call or recording (it remembers the audio
+    just before, which is what makes it accurate)."""
+    WINDOW, CONTEXT = 512, 64    # Silero reads 32 ms at a time at 16 kHz, plus 4 ms before it
+
+    def __init__(self):
+        from faster_whisper.vad import get_vad_model
+        self.session = get_vad_model().session    # loaded once, shared
+        self.reset()
+
+    def reset(self) -> None:
+        self.h = np.zeros((1, 1, 128), np.float32)
+        self.c = np.zeros((1, 1, 128), np.float32)
+        self.context = np.zeros(self.CONTEXT, np.float32)
+        self.buf = np.zeros(0, np.float32)
+        self.last = 0.0
+
+    def prob(self, block: np.ndarray) -> float:
+        """Chance (0 to 1) that this block of mic audio is someone talking."""
+        self.buf = np.concatenate([self.buf, np.asarray(block, np.float32)])
+        n = len(self.buf) // self.WINDOW
+        if not n:
+            return self.last
+        windows = self.buf[:n * self.WINDOW].reshape(n, self.WINDOW)
+        self.buf = self.buf[n * self.WINDOW:]
+        before = np.vstack([self.context[None], windows[:-1, -self.CONTEXT:]])
+        out, self.h, self.c = self.session.run(
+            None, {"input": np.concatenate([before, windows], 1), "h": self.h, "c": self.c})
+        self.context = windows[-1, -self.CONTEXT:].copy()
+        self.last = float(np.max(out))
+        return self.last
+
+
+def new_detector() -> "SpeechDetector | None":
+    """A voice detector, or None (loudness only) if it's turned off or can't load."""
+    if str(VOICE.get("vad", True)).lower() in ("false", "0", "no", "off"):
+        return None
+    try:
+        return SpeechDetector()
+    except Exception as e:
+        print(f"(voice detection unavailable, using loudness only: {e})", flush=True)
+        return None
+
+
 def record_until_silence(threshold: float, stop: threading.Event | None = None) -> np.ndarray:
     """Record from the mic until the speaker goes quiet (or `stop` is set: the mic button)."""
     chunk = int(MIC_RATE * 0.1)  # 100 ms blocks
     frames, quiet_blocks, heard_voice = [], 0, False
     needed_quiet = int(SILENCE_SECONDS / 0.1)
+    vad = new_detector()
 
     with sd.InputStream(samplerate=MIC_RATE, channels=1, dtype="float32") as stream:
         for _ in range(int(MAX_RECORD_SECONDS / 0.1)):
@@ -107,7 +157,8 @@ def record_until_silence(threshold: float, stop: threading.Event | None = None) 
                 break
             block, _ = stream.read(chunk)
             frames.append(block[:, 0].copy())
-            loud = np.sqrt(np.mean(block ** 2)) > threshold
+            p = vad.prob(block[:, 0]) if vad else 1.0
+            loud = np.sqrt(np.mean(block ** 2)) > threshold and p >= (VAD_OFF if heard_voice else VAD_ON)
             if loud:
                 heard_voice, quiet_blocks = True, 0
             elif heard_voice:
@@ -119,19 +170,48 @@ def record_until_silence(threshold: float, stop: threading.Event | None = None) 
 
 NOISE_GUESSES = {"you", "thank you", "thanks", "bye", "the", "uh", "um", "hmm", "so", "okay", "oh"}
 
+# NUBB-E's name as speech to text spells it ("Hey newbie", "Hey Nuby", "Hey NUBB!").
+# "newbie" is only fixed right after a greeting, so the real word still works in a sentence.
+NAME_FIXES = (
+    (re.compile(r"\b(?:noo?b(?:ie|ee|y|i|e)|nub(?:b?(?:ie|y|i|ee)|be|b)|newbee|nubb-e)(?![\w-])", re.IGNORECASE), "NUBB-E"),
+    (re.compile(r"^(\W*(?:(?:hey|hi|hello|okay|ok|yo|thanks|thank you)\W+)?)newbie\b", re.IGNORECASE), r"\1NUBB-E"),
+)
 
-def transcribe(model: WhisperModel, audio: np.ndarray) -> str:
+
+def fix_names(text: str) -> str:
+    for pattern, name in NAME_FIXES:
+        text = pattern.sub(name, text)
+    return text
+
+
+class Parakeet:
+    """NVIDIA Parakeet TDT 0.6B v2 (CC-BY-4.0), English, run with onnx-asr (MIT) on the CPU.
+    About 0.1 s per sentence on this laptop, 4x faster than Whisper base.en, same accuracy."""
+    NAME = "nemo-parakeet-tdt-0.6b-v2"
+
+    def __init__(self):
+        import onnx_asr
+        self.model = onnx_asr.load_model(self.NAME, quantization="int8")
+
+    def text(self, audio: np.ndarray) -> str:
+        return str(self.model.recognize(np.asarray(audio, np.float32), sample_rate=MIC_RATE)).strip()
+
+
+def transcribe(model, audio: np.ndarray) -> str:
     peak = float(np.abs(audio).max()) if audio.size else 0.0
     if 0 < peak < 0.5:
-        audio = audio * (0.5 / peak)      # quiet mic: bring it up to a normal level, Whisper hears much better
-    segments, _ = model.transcribe(audio, language="en", vad_filter=True,
-                                   initial_prompt="NUBB-E, Erfan.")   # so it knows these names
-    # skip bits Whisper itself isn't sure were speech (noise, a click, NUBB-E's own echo)
-    text = " ".join(s.text.strip() for s in segments
-                    if s.no_speech_prob < 0.6 and s.avg_logprob > -1.0).strip()
+        audio = audio * (0.5 / peak)      # quiet mic: bring it up to a normal level, both ears hear much better
+    if isinstance(model, Parakeet):
+        text = model.text(audio)
+    else:
+        segments, _ = model.transcribe(audio, language="en", vad_filter=True,
+                                       initial_prompt="NUBB-E, Erfan.")   # so it knows these names
+        # skip bits Whisper itself isn't sure were speech (noise, a click, NUBB-E's own echo)
+        text = " ".join(s.text.strip() for s in segments
+                        if s.no_speech_prob < 0.6 and s.avg_logprob > -1.0).strip()
     if text.lower().strip(" .!?,") in NOISE_GUESSES:
-        return ""                         # Whisper's usual guesses on noise or a breath
-    return text
+        return ""                         # the usual guesses on noise or a breath
+    return fix_names(text)
 
 
 # ---------- speaking ----------
@@ -219,7 +299,7 @@ class Cues:
     Any other sentence is made fresh as before. Changing the voice or speed makes a new set."""
     LINES = ("Let me look that up.", "Let me read that.", "Let me look at the form.", "Let me find it.",
              "One sec.", "Let me look.", "On it.", "Okay, I won't.", "Still on it, one sec.",
-             "Waking up, one sec.")
+             "Waking up, one sec.", "Yes?")
     DIR = Path.home() / ".nubbe" / "cues"
 
     def __init__(self):
@@ -563,7 +643,10 @@ def main() -> None:
                    help="Piper .onnx voice to fall back to if Kokoro can't load")
     p.add_argument("--tts-gpu", action="store_true", help="let Kokoro use the GPU (default: CPU)")
     p.add_argument("--prompt", default="nubbe_system_prompt.txt", help="personality file")
+    p.add_argument("--ears", default=VOICE.get("ears", "parakeet"), choices=("parakeet", "whisper"),
+                   help="speech to text: parakeet (fast) or whisper")
     p.add_argument("--whisper", default=VOICE["whisper_model"], help="tiny.en / base.en / small.en")
+    p.add_argument("--wake", action="store_true", help='listen for "Hey NUBB-E" instead of a call')
     p.add_argument("--threshold", type=float, default=VOICE["mic_threshold"],
                    help="mic loudness to count as talking")
     p.add_argument("--serve", action="store_true",
@@ -594,7 +677,10 @@ def main() -> None:
         return
     set_face("happy", "Hi Erfan!")
     try:
-        if args.push_to_talk:
+        if args.wake:
+            print('Say "Hey NUBB-E" and then your question. Ctrl+C to quit.')
+            Call(stt, st, speak_q, args.threshold, wake=True).run()
+        elif args.push_to_talk:
             print("NUBB-E is listening. Press Enter, then talk. Ctrl+C to quit.")
             while True:
                 input()
@@ -641,10 +727,24 @@ def mic_test() -> None:
     print("Saved. The app's mic button uses it next time voice starts.")
 
 
+def load_ears(args):
+    """Parakeet if it's chosen and can load, otherwise Whisper. Parakeet downloads once (about 650 MB)."""
+    if args.ears == "parakeet":
+        try:
+            return Parakeet()
+        except ImportError:
+            print("(Parakeet needs: pip install onnx-asr[hub]. Using Whisper.)", flush=True)
+        except Exception as e:
+            if os.environ.get("HF_HUB_OFFLINE") == "1" and not ASKED_OFFLINE:
+                raise                       # not downloaded yet: load_models goes online once and retries
+            print(f"(Parakeet couldn't load: {e}. Using Whisper.)", flush=True)
+    return WhisperModel(args.whisper, device="cpu", compute_type="int8")
+
+
 def load_models(args):
-    """Whisper (ears) + Kokoro (voice), both on the CPU so the GPU stays free for the brain."""
+    """Ears (Parakeet or Whisper) + Kokoro (voice), all on the CPU so the GPU stays free for the brain."""
     def load():
-        stt = WhisperModel(args.whisper, device="cpu", compute_type="int8")
+        stt = load_ears(args)
         tts = load_tts(args.voice, args.speed, args.piper_voice)
         audio, rate = tts.synth("Hello there.")           # warm up the ears too, so the first question is fast
         if audio.size:
@@ -656,7 +756,7 @@ def load_models(args):
     except (Exception, SystemExit) as e:
         if os.environ.get("HF_HUB_OFFLINE") != "1" or ASKED_OFFLINE:
             raise
-        print(f"(speech models not downloaded yet: {e})\nDownloading them once (about 800 MB)...", flush=True)
+        print(f"(speech models not downloaded yet: {e})\nDownloading them once (up to about 1.2 GB)...", flush=True)
         os.environ["HF_HUB_OFFLINE"] = "0"
         import huggingface_hub.constants
         huggingface_hub.constants.HF_HUB_OFFLINE = False
@@ -742,32 +842,72 @@ def barge_in_allowed() -> bool:
     return str(VOICE.get("barge_in", True)).lower() not in ("false", "0", "no", "off")
 
 
+# "Hey NUBB-E, ..." (after fix_names). Also just "NUBB-E, ...".
+WAKE = re.compile(r"^\W*(?:(?:hey|hi|hello|okay|ok|yo)\W+)?NUBB-E(?![\w-])[\s,.!?:;-]*", re.IGNORECASE)
+
+
+def wake_rest(text: str) -> str | None:
+    """What comes after "Hey NUBB-E" ("" if that's all), or None if the text doesn't start with it."""
+    m = WAKE.match(text)
+    return text[m.end():].strip() if m else None
+
+
+def tell_app_to_wake() -> None:
+    """Heard "Hey NUBB-E": the app starts loading the brain now, while the rest is still being said."""
+    try:
+        req = urllib.request.Request(APP_URL.replace("/api/chat", "/api/wake"), data=b"{}",
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=1).close()
+    except (urllib.error.URLError, OSError):
+        pass
+
+
 class Call:
     """Hands-free voice call, like a phone call: the mic stays open, NUBB-E answers when
-    Erfan pauses, then listens again. Talking while NUBB-E speaks interrupts it."""
+    Erfan pauses, then listens again. Talking while NUBB-E speaks interrupts it.
+
+    wake=True is "Hey NUBB-E" mode: the same loop, but NUBB-E only answers a sentence that starts
+    with its name. That opens a short session where follow-ups need no name. A session has a hard
+    time limit, so a TV can't keep it open. Anything else it hears is dropped right away: not printed,
+    saved or logged, and only the first seconds of it are turned into text to check for the name."""
     BLOCK = 0.1            # seconds of audio per step
-    START_BLOCKS = 2       # this much loud audio starts a turn (0.2 s)
+    START_BLOCKS = 2       # this much speech starts a turn (0.2 s)
     BARGE_BLOCKS = 3       # interrupting needs a little more (0.3 s), so a cough doesn't cut it off
     PREROLL_BLOCKS = 3     # keep 0.3 s from just before the speech started, so the first word isn't clipped
+    FOLLOW_UP = 8.0        # wake mode: seconds after NUBB-E finishes when a follow-up needs no name
+    SESSION_MAX = 120.0    # wake mode: a session never lasts longer than this after the name was said
+    WAKE_CHECK = 2.5       # wake mode: seconds of a sentence read to look for the name
 
-    def __init__(self, stt, st: dict, speak_q, threshold: float):
+    def __init__(self, stt, st: dict, speak_q, threshold: float, wake: bool = False):
         self.stt, self.st, self.speak_q, self.threshold = stt, st, speak_q, threshold
+        self.wake = wake
+        self.awake_until = 0.0     # wake mode: follow-ups without the name until then
+        self.session_end = 0.0
         self.blocks: "queue.Queue[np.ndarray]" = queue.Queue()
         self.hangup = threading.Event()
         self.done = threading.Event()
         self.reply: threading.Thread | None = None
         self.echo = threshold      # how loud NUBB-E's own voice comes back into the mic (learned as it talks)
         self.barge_in = barge_in_allowed()
+        self.vad = new_detector()
         self.pending = None        # "what do you think about..." : audio waiting for the rest of the sentence
         self.pending_until = 0.0
         self.pending_barged = False
 
+    def awake(self) -> bool:
+        return not self.wake or time.time() < self.awake_until
+
     def run(self) -> None:
         """Blocks until hang_up() is called."""
-        IN_CALL.set()
-        self.st["chat_id"], self.st["source"] = None, "call"     # one saved chat per call
-        set_face("listening", "On a call")
-        print("(call started: just talk)", flush=True)
+        if self.wake:
+            self.st["source"] = "wake"
+            set_face("idle", 'Say "Hey NUBB-E"')
+            print('(listening for "Hey NUBB-E")', flush=True)
+        else:
+            IN_CALL.set()
+            self.st["chat_id"], self.st["source"] = None, "call"     # one saved chat per call
+            set_face("listening", "On a call")
+            print("(call started: just talk)", flush=True)
         try:
             with sd.InputStream(samplerate=MIC_RATE, channels=1, dtype="float32",
                                 blocksize=int(MIC_RATE * self.BLOCK),
@@ -781,8 +921,12 @@ class Call:
             IN_CALL.clear()
             hush(self.speak_q)
             self.st["source"] = None
-            set_face("idle", "Call ended")
-            print("(call ended)", flush=True)
+            if self.wake:
+                set_face("idle")
+                print('(stopped listening for "Hey NUBB-E")', flush=True)
+            else:
+                set_face("idle", "Call ended")
+                print("(call ended)", flush=True)
 
     def hang_up(self) -> None:
         self.hangup.set()
@@ -799,11 +943,13 @@ class Call:
             if self.pending is not None and not speech and time.time() > self.pending_until:
                 audio, self.pending = self.pending, None     # no rest came: answer what we have
                 self._answer(audio, self.pending_barged, final=True)
+            self._wake_session_tick()
             try:
                 block = self.blocks.get(timeout=0.2)
             except queue.Empty:
                 continue
             level = float(np.sqrt(np.mean(block ** 2)))
+            voice = self.vad.prob(block) if self.vad else 1.0      # is it really speech (not a fan, a click)?
             talking = SPEAKING.is_set() or time.time() - LAST_SPOKE[0] < 0.3   # + its echo tail
             if talking and not self.barge_in:
                 pre, loud = [], 0        # interrupting turned off: wait until it's done talking
@@ -832,16 +978,19 @@ class Call:
                 self.echo = 0.9 * self.echo + 0.1 * level
             if not speech:
                 pre = (pre + [block])[-self.PREROLL_BLOCKS:]
-                loud = loud + 1 if level > gate else max(0, loud - 1)   # a dip between syllables is fine
+                # a dip between syllables is fine
+                loud = loud + 1 if level > gate and voice >= VAD_ON else max(0, loud - 1)
                 if loud >= (self.BARGE_BLOCKS if talking else self.START_BLOCKS):
                     speech, quiet = list(pre), 0
                     barged = talking or GENERATING.is_set() or PLAYER.has_audio()
                     if barged:
                         PLAYER.pause()           # stop talking right away; resume if it was just a noise
-                    set_face("listening")
+                    if self.awake():
+                        set_face("listening")
                 continue
             speech.append(block)
-            quiet = 0 if level > quiet_bar else quiet + 1
+            # the sentence ends when it's quiet again, or when what's left is only noise (a fan, a hum)
+            quiet = 0 if level > quiet_bar and voice >= VAD_OFF else quiet + 1
             if quiet * self.BLOCK >= SILENCE_SECONDS or len(speech) * self.BLOCK >= MAX_RECORD_SECONDS:
                 audio = np.concatenate(speech)
                 if self.pending is not None:                  # the rest of an unfinished sentence
@@ -850,8 +999,54 @@ class Call:
                 self._answer(audio, barged)
                 speech, pre, loud = [], [], 0
 
+    def _wake_session_tick(self) -> None:
+        """Wake mode: keep a session open while NUBB-E answers, close it after the follow-up time."""
+        if not self.wake or not self.awake_until:
+            return
+        now = time.time()
+        if SPEAKING.is_set() or GENERATING.is_set() or PLAYER.has_audio() or not self.speak_q.empty():
+            self.awake_until = min(self.session_end, max(self.awake_until, now + self.FOLLOW_UP))
+        if now >= self.awake_until:
+            self.awake_until = 0.0
+            IN_CALL.clear()
+            if not (SPEAKING.is_set() or GENERATING.is_set()):
+                set_face("idle")
+            print('(back to listening for "Hey NUBB-E")', flush=True)
+
+    def _wake_check(self, audio: np.ndarray) -> str | None:
+        """Wake mode, no session open: the text if it starts with "Hey NUBB-E", else None (and it's
+        dropped without a trace). Reads the first few seconds first, so long chatter costs little."""
+        head = audio[:int(MIC_RATE * self.WAKE_CHECK)]
+        rest = wake_rest(transcribe(self.stt, head))
+        if rest is None:
+            return None
+        threading.Thread(target=tell_app_to_wake, daemon=True).start()
+        if len(audio) > len(head):                 # a longer sentence: now read all of it
+            heard = transcribe(self.stt, audio)
+            full_rest = wake_rest(heard)
+            rest = full_rest if full_rest is not None else heard
+        now = time.time()
+        self.awake_until, self.session_end = now + self.FOLLOW_UP, now + self.SESSION_MAX
+        self.st["chat_id"] = None              # each session is one saved chat
+        IN_CALL.set()
+        set_face("listening")
+        print('(heard "Hey NUBB-E")', flush=True)
+        return rest or ""
+
     def _answer(self, audio: np.ndarray, barged: bool, final: bool = False) -> None:
-        heard = transcribe(self.stt, audio)
+        if not self.awake():
+            heard = self._wake_check(audio)
+            if heard is None:
+                PLAYER.resume()
+                return                             # not for NUBB-E: forget it
+            if not heard:
+                self.speak_q.put("Yes?")           # just the name: listen for the question
+                return
+        else:
+            heard = transcribe(self.stt, audio)
+            if self.wake and heard:
+                self.awake_until = min(self.session_end, time.time() + self.FOLLOW_UP)
+                heard = wake_rest(heard) or heard  # saying the name again mid-session is fine
         if not heard or self._is_own_echo(heard):
             PLAYER.resume()                        # just a noise or its own echo: carry on talking
             print("(ignored a noise)" if not heard else f"(ignored its own echo: {heard})", flush=True)
@@ -899,6 +1094,8 @@ class Call:
         import difflib
         said = " ".join(RECENT_SPEECH[-3:] + [REPLY_SO_FAR[0]]).lower()
         h = re.sub(r"[^a-z0-9 ]", "", heard.lower())
+        if h.strip() and h.strip() in {re.sub(r"[^a-z0-9 ]", "", s.lower()).strip() for s in RECENT_SPEECH[-3:]}:
+            return True                    # a short line it just said, like "Yes?", coming back in full
         return bool(said) and len(h) > 3 and difflib.SequenceMatcher(
             None, h, re.sub(r"[^a-z0-9 ]", "", said)).find_longest_match().size >= max(12, len(h) * 0.6)
 
@@ -907,20 +1104,38 @@ def serve(stt, st: dict, speak_q, threshold: float) -> None:
     """Controlled by the app: reads one command per line on stdin.
     call   = start a hands-free call.   hangup = end it.
     listen = push-to-talk turn, or stop recording early if already listening.
-    stop   = stop listening / stop talking (ends a call too).   quit = exit."""
+    stop   = stop listening / stop talking (ends a call too).   quit = exit.
+    wake_on / wake_off = listen for "Hey NUBB-E" in between (paused during a call or a push-to-talk turn)."""
     stop = threading.Event()
     busy = threading.Event()
     call: list[Call] = []
+    wake: list[Call] = []
+    wake_wanted = [False]
+
+    def start_wake():
+        if wake_wanted[0] and not wake and not call and not busy.is_set():
+            wake.append(Call(stt, st, speak_q, threshold, wake=True))
+            threading.Thread(target=wake[0].run, daemon=True).start()
+
+    def stop_wake():
+        if wake:
+            w = wake.pop()
+            w.hang_up()
+            w.done.wait(2)                # let go of the mic before something else opens it
 
     def turn():
         try:
             one_turn(stt, st, speak_q, threshold, stop)
         finally:
             busy.clear()
+            start_wake()
 
     def end_call():
         if call:
-            call.pop().hang_up()
+            c = call.pop()
+            c.hang_up()
+            c.done.wait(2)
+        start_wake()
 
     print("READY", flush=True)
     set_face("idle")
@@ -930,8 +1145,15 @@ def serve(stt, st: dict, speak_q, threshold: float) -> None:
             break
         if call and call[0].done.is_set():
             call.clear()                  # the last call ended by itself (e.g. mic problem)
+        if wake and wake[0].done.is_set():
+            wake.clear()
+        if cmd in ("wake_on", "wake_off"):
+            wake_wanted[0] = cmd == "wake_on"
+            start_wake() if wake_wanted[0] else stop_wake()
+            continue
         if cmd == "call":
             if not call and not busy.is_set():
+                stop_wake()
                 call.append(Call(stt, st, speak_q, threshold))
                 threading.Thread(target=call[0].run, daemon=True).start()
             continue
@@ -949,9 +1171,12 @@ def serve(stt, st: dict, speak_q, threshold: float) -> None:
             continue
         if cmd == "listen":
             hush(speak_q)
+            stop_wake()
             stop.clear()
             busy.set()
             threading.Thread(target=turn, daemon=True).start()
+    wake_wanted[0] = False
+    stop_wake()
     end_call()
     hush(speak_q)
     speak_q.put(None)

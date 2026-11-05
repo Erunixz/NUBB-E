@@ -13,6 +13,7 @@ sounddevice
 numpy
 kokoro>=0.9.4
 soundfile
+onnx-asr[hub]      # Parakeet ears (speech to text), about 4x faster than Whisper on the CPU
 piper-tts          # optional backup voice
 
 # tests only

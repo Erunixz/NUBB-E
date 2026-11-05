@@ -36,6 +36,9 @@ DEFAULTS = {
         "close_to_background": True,
     },
     "voice": {
+        "ears": "parakeet",          # speech to text: "parakeet" (fast) or "whisper"
+        "vad": True,                 # Silero voice detection on top of mic_threshold
+        "wake_phrase": False,        # listen for "Hey NUBB-E" all the time
         "whisper_model": "base.en",
         "kokoro_voice": "af_heart",
         "kokoro_speed": 1.0,

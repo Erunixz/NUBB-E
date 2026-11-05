@@ -414,19 +414,22 @@ class Voice:
         self.job = None
         self.log = None
         self.in_call = False
+        self.wake = False            # listen for "Hey NUBB-E" (wake_phrase in config.toml)
         self.lock = threading.Lock()
 
     def send(self, cmd: str) -> str:
         if cmd in ("call", "listen"):
             BRAIN.wake()    # he's about to talk: the brain loads while he does
         with self.lock:
+            if cmd in ("wake_on", "wake_off"):
+                self.wake = cmd == "wake_on"
             if cmd in ("call", "hangup"):
                 self.in_call = cmd == "call"
             elif cmd == "stop":
                 self.in_call = False
             if self.proc is None or self.proc.poll() is not None:
                 self.in_call = self.in_call and cmd == "call"
-                if cmd not in ("listen", "call"):
+                if cmd not in ("listen", "call", "wake_on"):
                     return "off"
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
                 if self.log:
@@ -438,8 +441,11 @@ class Voice:
                     env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1",
                              NUBBE_VOICE_TOKEN=VOICE_TOKEN))
                 self.job = tie_to_app(self.proc)
-                broadcast({"state": "thinking", "status": "connecting..."})
                 status = "starting"
+                if self.wake:     # "Hey NUBB-E" listening comes back on whenever the helper restarts
+                    self.proc.stdin.write("wake_on\n")
+                if cmd != "wake_on":
+                    broadcast({"state": "thinking", "status": "connecting..."})
                 if llm_alive():   # get the brain's voice slot ready while the speech models load
                     threading.Thread(target=warm_slot, args=(VOICE_SLOT,),
                                      daemon=True).start()
@@ -1232,6 +1238,9 @@ def main() -> None:
         with BRAIN.lock:
             BRAIN.start()
     threading.Thread(target=BRAIN.watch_idle, daemon=True).start()
+    if str(CFG["voice"].get("wake_phrase", False)).lower() in ("true", "1", "yes", "on"):
+        print('Listening for "Hey NUBB-E" (wake_phrase in config.toml).')
+        threading.Thread(target=VOICE.send, args=("wake_on",), daemon=True).start()
 
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{args.port}"

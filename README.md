@@ -49,15 +49,28 @@ Headphones work best. With laptop speakers, NUBB-E filters out its own voice so 
 
 Speech runs on the CPU, so the GPU stays free for the brain:
 
-- **Ears:** Whisper `base.en` (faster-whisper)
-- **Voice:** Kokoro-82M, voice `am_puck` (change `kokoro_voice` in `config.toml`)
+- **Ears:** NVIDIA Parakeet TDT 0.6B v2 (int8, run with onnx-asr), about 0.1 s per sentence. Whisper `base.en` (faster-whisper) is the backup, or set `ears = "whisper"` in `config.toml`
+- **Hearing you talk:** Silero VAD (the copy inside faster-whisper), so fans, clicks and music don't start a turn
+- **Voice:** Kokoro-82M, voice `am_puck` (change `kokoro_voice` in `config.toml`). Short lines like "On it." are made once and saved in `~/.nubbe/cues/`, so they play at once
 - **Backup voice:** Piper `en_US-amy-medium` in `voices/`, used only if Kokoro can't load
+
+### "Hey NUBB-E"
+
+Set `wake_phrase = true` in `config.toml` and NUBB-E listens all the time: say "Hey NUBB-E, what's the time?" and it answers. For a few seconds after it answers, follow-ups need no name. A session never lasts more than 2 minutes, so a TV can't keep it open. Anything that doesn't start with its name is dropped right away, never saved or logged. Windows shows the mic as in use while it listens. It's off by default.
+
+### Credits
+
+- Parakeet TDT 0.6B v2 by NVIDIA, CC-BY-4.0, ONNX export by Ilya Stupakov (istupakov/parakeet-tdt-0.6b-v2-onnx)
+- onnx-asr by Ilya Stupakov, MIT
+- Silero VAD by Silero Team, MIT
+- Kokoro-82M by hexgrad, Apache 2.0
+- faster-whisper by SYSTRAN, MIT
 
 ### One-time setup
 
 1. Install espeak-ng (Kokoro uses it for unusual words): `winget install eSpeak-NG.eSpeak-NG`
 2. Install the Python parts: `.venv\Scripts\python -m pip install -r requirements.txt`
-3. With internet on, start voice once (press Call, or run `.venv\Scripts\python nubbe_voice.py`). It downloads the speech models (about 800 MB) to `~/.cache/huggingface`.
+3. With internet on, start voice once (press Call, or run `.venv\Scripts\python nubbe_voice.py`). It downloads the speech models (about 1.5 GB with Parakeet) to `~/.cache/huggingface`.
 
 ### Offline
 
@@ -75,4 +88,4 @@ Run the mic test. It listens to your room for 3 seconds, then to you for 4 secon
 
 ### Speed
 
-On this laptop, NUBB-E starts speaking about 3 to 4.5 seconds after you stop talking: 0.6 s to be sure you're done, about 0.8 s to understand you, 1 to 2 s for the brain to start its answer, and about 0.6 to 1.4 s to say its first words.
+On this laptop, NUBB-E starts speaking about 2.5 to 4 seconds after you stop talking: 0.6 s to be sure you're done, about 0.1 s to understand you (Parakeet; Whisper took about 0.5 to 0.8 s), 1 to 2 s for the brain to start its answer, and about 0.6 to 1.4 s to say its first words. If the brain was asleep, it starts loading the moment you press Call, open the quick bar or say "Hey NUBB-E".
