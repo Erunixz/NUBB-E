@@ -29,8 +29,14 @@ CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL, cr
 CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, text TEXT NOT NULL, due REAL NOT NULL,
     kind TEXT NOT NULL, created REAL, fired INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS routines (name TEXT PRIMARY KEY, steps TEXT NOT NULL, created REAL);
+CREATE TABLE IF NOT EXISTS dict_words (heard TEXT PRIMARY KEY, written TEXT NOT NULL, created REAL);
+CREATE TABLE IF NOT EXISTS snippets (name TEXT PRIMARY KEY, text TEXT NOT NULL, created REAL);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
-ASK_FIRST = {"clear_todos", "delete_note", "delete_routine"}
+ASK_FIRST = {"clear_todos", "delete_note", "delete_routine", "delete_word", "delete_snippet"}
+# dictation settings: understood from Erfan's own words only, never offered to the brain as tools
+RULE_ONLY = {"dictation_mode", "add_word", "delete_word", "add_snippet", "delete_snippet", "list_dictionary"}
+DICTATION_MODES = ("exact", "clean", "polished")
 
 
 class ActionError(Exception):
@@ -184,8 +190,9 @@ class Actions:
     """Everyday actions on top of the app's database. web_search(query) -> results text (or None when
     offline), weather() -> "Light rain, +12°C" or None; both are optional."""
 
-    def __init__(self, connect, web_search=None, weather=None):
+    def __init__(self, connect, web_search=None, weather=None, dictation_mode="clean"):
         self.connect = connect
+        self.default_mode = dictation_mode
         self.web_search = web_search
         self.weather = weather
 
@@ -217,6 +224,10 @@ class Actions:
         t = clean(text)
         if not t or len(t) > 300 or "\n" in t:
             return None
+        whole = LEAD.sub("", " ".join(str(text).split())).rstrip(" .!?")   # keeps a last word like "NUBB-E"
+        if m := (re.fullmatch(r"(?:always )?spell (.+?) (?:as|like) (.+)", whole, I) or
+                 re.fullmatch(r"when (?:i say|you hear) (.+?),? (?:write|type|spell it(?: as)?) (.+)", whole, I)):
+            return [("add_word", {"heard": m[1], "written": m[2]})]
         one = self._one(t)
         if one:
             return [one]
@@ -231,6 +242,26 @@ class Actions:
         if f(r"good morning(?: buddy)?|(?:my |the )?(?:morning|daily) briefing|brief me|what'?s my day(?: look like)?|"
              r"what does my day look like|what'?s (?:on )?(?:for )?today"):
             return "briefing", {}
+        # dictation: mode, personal dictionary, snippets
+        if m := (f(r"(?:set |switch |change |put )?(?:the |my )?dictation(?: mode)? (?:to |on |in )?(exact|clean|polished)(?: mode)?") or
+                 f(r"(?:use |switch to )?(exact|clean|polished) (?:dictation|mode)(?: for dictation)?")):
+            return "dictation_mode", {"mode": m[1].lower()}
+        if f(r"what(?:'s| is) (?:the |my )?dictation mode|which dictation mode(?: is on| am i using)?"):
+            return "dictation_mode", {}
+        if m := (f(r"(?:always )?spell (.+?) (?:as|like) (.+)") or
+                 f(r"when (?:i say|you hear) (.+?),? (?:write|type|spell it(?: as)?) (.+)")):
+            return "add_word", {"heard": m[1], "written": m[2]}
+        if m := f(r"(?:add|put|save) (.+?) (?:to|in) (?:my |the )?(?:dictionary|vocabulary|word list)"):
+            return "add_word", {"written": m[1]}
+        if m := f(r"(?:remove|delete|forget) (.+?) from (?:my |the )?(?:dictionary|vocabulary|word list)"):
+            return "delete_word", {"word": m[1]}
+        if m := f(r"(?:add|save|make|create) (?:a |the |new )?snippet (?:called |named |for )?(.+?)\s*(?::| is | as | that says | saying |-)\s*(.+)"):
+            return "add_snippet", {"name": m[1], "text": m[2]}
+        if m := f(r"(?:remove|delete|forget) (?:the |my )?snippet (?:called |named |for )?(.+)"):
+            return "delete_snippet", {"name": m[1]}
+        if f(r"(?:show|list|read|what'?s in|what is in)(?: me)? (?:my |the )?(?:dictionary|snippets|dictation words|"
+             r"dictation settings)|what snippets do i have"):
+            return "list_dictionary", {}
         # routines
         if m := f(r"(?:make|create|save|add|set up) (?:a |me a |new )?routine (?:called|named) (.+?)\s*(?::|-|,| that | which | to )\s*(.+)"):
             return "make_routine", {"name": m[1], "steps": [s for s in SPLIT.split(m[2]) if s.strip()]}
@@ -364,7 +395,7 @@ class Actions:
     # ---- running actions (from rules or from the brain) ----
     def call(self, name: str, args: dict, approved: bool | None = None) -> str:
         fn = getattr(self, "do_" + name, None)
-        if fn is None or name not in TOOLS:
+        if fn is None or name not in TOOLS | RULE_ONLY:
             return f"There's no action called {name}."
         if name in ASK_FIRST and not approved:
             return "Erfan said No, so nothing was changed." if approved is False else "Not allowed without Erfan's Yes."
@@ -386,6 +417,13 @@ class Actions:
             note = self._find_note(args.get("which", ""))
             return {"title": "Delete a note", "target": "", "detail": note["text"] if note else str(args),
                     "say": "Delete that note? Say yes or no."}
+        if name == "delete_word":
+            return {"title": "Remove a word from your dictionary", "target": str(args.get("word", "")), "detail": "",
+                    "say": "Remove that word from your dictionary?"}
+        if name == "delete_snippet":
+            hit = self._snippet(args.get("name", ""))
+            return {"title": "Delete a snippet", "target": hit["name"] if hit else str(args.get("name", "")),
+                    "detail": hit["text"] if hit else "", "say": "Delete that snippet?"}
         if name == "delete_routine":
             return {"title": "Delete a routine", "target": str(args.get("name", "")),
                     "detail": "\n".join(self.routine(args.get("name", "")) or []), "say": "Delete that routine?"}
@@ -575,6 +613,69 @@ class Actions:
             raise ActionError(f"There's no routine called {name}.")
         return f"Deleted the routine {name}."
 
+    # dictation
+    def dictation(self) -> dict:
+        """What dictation needs: the mode, {heard: written} and {snippet name: text}."""
+        r = self.rows("SELECT value FROM settings WHERE key = 'dictation_mode'")
+        mode = r[0]["value"] if r and r[0]["value"] in DICTATION_MODES else self.default_mode
+        return {"mode": mode,
+                "words": {w["heard"]: w["written"] for w in self.rows("SELECT heard, written FROM dict_words")},
+                "snippets": {n["name"]: n["text"] for n in self.rows("SELECT name, text FROM snippets")}}
+
+    def do_dictation_mode(self, mode=None):
+        if mode is None:
+            return f"Dictation is in {self.dictation()['mode']} mode."
+        mode = str(mode).lower().strip()
+        if mode not in DICTATION_MODES:
+            raise ActionError("Dictation modes are exact, clean and polished.")
+        self.run("INSERT OR REPLACE INTO settings(key, value) VALUES ('dictation_mode', ?)", (mode,))
+        return {"exact": "Dictation is exact now: your words as heard.",
+                "clean": "Dictation is clean now: no ums, tidy punctuation, spoken lists.",
+                "polished": "Dictation is polished now: the brain also fixes small mishearings."}[mode]
+
+    def do_add_word(self, written, heard=None):
+        written = str(written).strip().strip("\"'.")
+        heard = " ".join(str(heard or written).lower().strip().strip("\"'.").split())
+        if not written or not heard or len(written) > 60 or len(heard) > 60:
+            raise ActionError("Tell me the word, like: spell nubby as NUBB-E.")
+        self.run("INSERT OR REPLACE INTO dict_words(heard, written, created) VALUES (?, ?, ?)", (heard, written, time.time()))
+        return (f"Okay, I'll write {written} when I hear {heard}." if heard != written.lower()
+                else f"Added {written} to your dictionary.")
+
+    def do_delete_word(self, word):
+        w = " ".join(str(word).lower().strip().strip("\"'.").split())
+        if not self.run("DELETE FROM dict_words WHERE heard = ? OR lower(written) = ?", (w, w)):
+            raise ActionError(f"{word} isn't in your dictionary.")
+        return f"Removed {word} from your dictionary."
+
+    def _snippet(self, name):
+        r = self.rows("SELECT name, text FROM snippets WHERE name = ?", (_snippet_key(name),))
+        return r[0] if r else None
+
+    def do_add_snippet(self, name, text):
+        key, text = _snippet_key(name), str(text).strip()
+        if not key or not text:
+            raise ActionError("A snippet needs a name and text, like: add a snippet called my address: 12 Main St.")
+        self.run("INSERT OR REPLACE INTO snippets(name, text, created) VALUES (?, ?, ?)", (key, text[:2000], time.time()))
+        return f"Saved. Say \"insert my {key}\" while dictating and I'll type it."
+
+    def do_delete_snippet(self, name):
+        if not self.run("DELETE FROM snippets WHERE name = ?", (_snippet_key(name),)):
+            raise ActionError(f"There's no snippet called {name}.")
+        return f"Deleted the snippet {_snippet_key(name)}."
+
+    def do_list_dictionary(self):
+        d = self.dictation()
+        lines = [f"Dictation mode: {d['mode']}."]
+        if d["words"]:
+            lines.append("Words: " + ", ".join(w if h == w.lower() else f"{h} -> {w}" for h, w in d["words"].items()) + ".")
+        if d["snippets"]:
+            lines.append("Snippets: " + ", ".join(f'"insert my {n}"' for n in d["snippets"]) + ".")
+        if not d["words"] and not d["snippets"]:
+            lines.append("No dictionary words or snippets yet. Try: spell nubby as NUBB-E, or add a snippet called "
+                         "my address: ...")
+        return "\n".join(lines)
+
     # good morning
     def do_briefing(self):
         now = datetime.now()
@@ -604,6 +705,11 @@ class Actions:
 
 def _key(name: str) -> str:
     return " ".join(re.sub(r"[^\w' -]", " ", str(name).lower()).split())
+
+
+def _snippet_key(name: str) -> str:
+    """"my home address" -> "home address" (said as "insert my home address")."""
+    return re.sub(r"^(?:my|the|our)\s+", "", _key(name))
 
 
 def _join(items: list[str]) -> str:

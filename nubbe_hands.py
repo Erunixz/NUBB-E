@@ -6,6 +6,10 @@
     hands.card(todo, skipped, missing)               # what the Yes/No card shows
     hands.fill(todo, ask, progress)                  # click and type, one field at a time, checking each
 
+First choice (Phase 6.7e): Windows UI Automation (nubbe_uia.py) reads the real names, places and contents
+of the fields and buttons in the front window, so clicking, filling and "where's the export button?" work
+by name, and each typed field is checked by reading it back. Apps that don't support it fall back to:
+
 How it works: a screenshot goes to the vision model, which finds each field (as a box on a
 0 to 1000 scale) and picks its value using only facts Erfan gave (memory, his request, the
 chat). After Yes, NUBB-E clicks into each field, types the text (Windows SendInput, no
@@ -24,7 +28,7 @@ import time
 from contextlib import contextmanager
 
 IS_WINDOWS = sys.platform == "win32"
-TOOLS = ("fill_form", "click_on")
+TOOLS = ("fill_form", "click_on", "where_is")
 SUPPORTED = {"text", "textarea", "other"}       # dropdowns, checkboxes and radio buttons: not yet
 PRIVATE = re.compile(
     r"pass(word|code|phrase)|\bpin\b|card|cvv|cvc|security code|expir|iban|swift|routing|"
@@ -70,7 +74,8 @@ RULES = (
     "you, and you ask him. You never fill passwords, payment or ID fields, and you never press Submit or "
     "Send: tell him that part is his. "
     "To click something on his screen (a browser tab, a link, a button), call click_on with what to click in "
-    "his words. It finds it, asks him first, then clicks. Don't say you can't click: you can, with click_on."
+    "his words. It finds it, asks him first, then clicks. Don't say you can't click: you can, with click_on. "
+    "To show him where something is without clicking (\"where's the export button?\"), call where_is."
 )
 
 CLICK_SCHEMA = {"type": "function", "function": {
@@ -81,6 +86,14 @@ CLICK_SCHEMA = {"type": "function", "function": {
     "parameters": {"type": "object", "properties": {
         "target": {"type": "string", "description": "What to click, in Erfan's words, like "
                                                     "'the Erfan | ML research tab in Chrome'."},
+    }, "required": ["target"]}}}
+
+WHERE_SCHEMA = {"type": "function", "function": {
+    "name": "where_is",
+    "description": "Show Erfan where something is on his screen (a button, link, tab, field...) by drawing a ring "
+                   "around it for a few seconds. Never clicks. Use it for 'where's the ... button?'.",
+    "parameters": {"type": "object", "properties": {
+        "target": {"type": "string", "description": "What to find, in Erfan's words, like 'the export button'."},
     }, "required": ["target"]}}}
 
 CLICK_PROMPT = """Erfan wants this clicked on his screen: "{target}"
@@ -114,9 +127,42 @@ VERIFY_PROMPT = ("This is a close-up of a form field labeled \"{label}\". What t
                  "Reply with only that text, exactly as shown. If the box is empty, reply EMPTY.")
 
 
+# "where's the export button?", "show me where the settings icon is", "point to the search box"
+WHERE_WORDS = re.compile(r"\b(?:where(?:'s| is| are)|show me where|point (?:to|at|me to)|highlight|can you find)\b.{0,60}?"
+                         r"\b(?:button|link|tab|icon|menu|field|box|option|setting|toggle|checkbox|switch|bar|slider|"
+                         r"dropdown|control)s?\b", re.IGNORECASE)
+# "take care of this: open YouTube and search for lo-fi", "agent mode: ..."
+AGENT_WORDS = re.compile(r"^\W*(?:(?:hey |ok |okay )?nubb-?e\W+)?(?:please |can you |could you )?"
+                         r"(?:take care of (?:this|it|that|these)(?: for me)?|handle (?:this|it|that) for me|agent mode|"
+                         r"do (?:this|these) (?:steps )?for me)\s*[:,.-]?\s+(.{6,})", re.IGNORECASE | re.DOTALL)
+
+
+LEAD_ASK = re.compile(r"^\W*(?:(?:hey |ok |okay )?nubb-?e\W+)?(?:(?:please|can you|could you|would you|just)\s+)*"
+                      r"(?:click(?: on)?|press(?: on)?|tap(?: on)?|hit|where(?:'s| is| are)|show me where|"
+                      r"point (?:to|at|me to)|highlight|find|can you find)\s+", re.IGNORECASE)
+TAIL_ASK = re.compile(r"(?:\s+(?:is|are|at|please|for me|on (?:the |my )?screen))*\W*$", re.IGNORECASE)
+
+
+def clean_target(text: str) -> str:
+    """"where's the share button?" -> "the share button" (for replies and for matching)."""
+    t = TAIL_ASK.sub("", LEAD_ASK.sub("", " ".join(str(text).split())))
+    return t or str(text).strip()
+
+
+def wants_where(text: str) -> bool:
+    """Erfan asked where something is on screen (NUBB-E rings it, no click)."""
+    return bool(WHERE_WORDS.search(text)) and not HOW_TO.search(text)
+
+
+def agent_task(text: str) -> str | None:
+    """The task in "take care of this: ...", or None."""
+    m = AGENT_WORDS.match(text.strip())
+    return " ".join(m[1].split()) if m else None
+
+
 def wants_click(text: str) -> bool:
     """Erfan asked NUBB-E to click something on screen (the app then calls click_on directly)."""
-    return bool(CLICK_WORDS.search(text)) and not HOW_TO.search(text) and not wants_fill(text)
+    return bool(CLICK_WORDS.search(text)) and not HOW_TO.search(text) and not wants_fill(text) and not wants_where(text)
 
 
 def wants_fill(text: str) -> bool:
@@ -523,3 +569,221 @@ def fill(todo: list, ask, progress=lambda line: None, log=lambda field, outcome:
             log(f, f"stopped: {e}")
             return done, str(e)
     return done, None
+
+
+# ---------------------------------------------------------------------------
+# UI Automation (first choice): real control names, places and contents
+# ---------------------------------------------------------------------------
+UIA_PLAN_PROMPT = """You're helping Erfan fill in a form. These are the fields in the window "{window}", top to bottom:
+{fields}
+
+Erfan's request: {request}
+
+Facts you may use (and nothing else):
+{facts}
+
+Reply with JSON only, like {{"fields": [{{"id": 1, "value": "Erfan Zamani"}}]}}, one entry per field you can fill.
+- value comes only from the facts above. If they don't say, leave the field out. Never guess or invent.
+- For an open question (like "Why do you want to join?"), write an answer only if Erfan's request asks for one.
+- Never fill password, payment, bank or ID fields."""
+
+MAX_UIA_FIELDS = 40
+
+
+def front_controls(read=None, front=None):
+    """((hwnd, title), controls) of the window in front, or None if UI Automation can't read it."""
+    import nubbe_uia as uia
+    try:
+        window = (front or uia.front_window)()
+        if not window[0]:
+            return None
+        found = (read or uia.read)(window[0])
+    except Exception:
+        return None
+    return (window, found) if found else None
+
+
+def find_control(target: str, read=None, front=None):
+    """(control, window) for Erfan's words, by its real name, or None to fall back to the screenshot."""
+    import nubbe_uia as uia
+    got = front_controls(read, front)
+    if not got:
+        return None
+    window, found = got
+    c = uia.find(found, clean_target(target))
+    return (c, window) if c else None
+
+
+def review_control(c, target: str, window) -> dict:
+    """The same rules as for the screenshot method: never Submit, Send, Pay, Delete and the like."""
+    label = " ".join((c.name or target).split())[:80]
+    if c.kind != "tab" and NO_CLICK.search(label):
+        raise TargetError(f"\"{label}\" is yours to press: I don't press Submit, Send, Pay, Delete and the like")
+    if not c.enabled:
+        raise TargetError(f"\"{label}\" is greyed out right now")
+    return {"label": label, "kind": c.kind, "rect": c.rect, "control": c}
+
+
+def click_control(spot: dict, window, hands=None, still_at=None) -> str:
+    """One click on a control found by name, after the Yes. It must still be there, in the same window."""
+    import nubbe_uia as uia
+    from look import hidden_window
+    still_at = still_at or uia.still_at
+    with dpi_aware(), hidden_window():
+        hands = hands or Hands()
+        x, y = spot["control"].center
+        if not still_at(spot["control"]) or hands.window_at(x, y)[0] != window[0]:
+            return f"I didn't click: {spot['label']} isn't where it was anymore."
+        try:
+            hands.click(x, y)
+        except Stopped as e:
+            return f"I didn't click because {e}."
+    return f"Done, I clicked {spot['label']}."
+
+
+def plan_form_uia(ask_text, request: str, facts: list[str], window, controls) -> list[dict] | None:
+    """The fields from UI Automation, and what goes in each (decided by the brain from their real names).
+    None if the window has no fields UI Automation can see (then the screenshot method is used)."""
+    import nubbe_uia as uia
+    boxes = uia.fields(controls)[:MAX_UIA_FIELDS]
+    if not boxes:
+        return None
+    listing = "\n".join(f"{i}. {c.name or '(no label)'}" + (" (password)" if c.password else "")
+                         + (f" (now: {c.value[:60]!r})" if c.value and not c.password else "")
+                         for i, c in enumerate(boxes, 1))
+    prompt = UIA_PLAN_PROMPT.format(window=window[1], fields=listing, request=request.strip() or "(none)",
+                                    facts="\n".join(f"- {f}" for f in facts) or "- (none)")
+    answer = parse_json(ask_text("You plan form filling. Reply with JSON only.", prompt, 1200))
+    values = {}
+    for f in answer.get("fields") or []:
+        if isinstance(f, dict) and isinstance(f.get("id"), int) and 1 <= f["id"] <= len(boxes) and f.get("value"):
+            values[f["id"]] = str(f["value"]).strip()
+    return [{"label": " ".join((c.name or f"field {i}").split())[:80], "kind": "password" if c.password else "text",
+             "rect": c.rect, "control": c, "current": c.value, "value": values.get(i)}
+            for i, c in enumerate(boxes, 1)]
+
+
+def review_uia(plan: list[dict]) -> tuple[list, list, list]:
+    """Same rules as review(): passwords (flagged by Windows itself), private fields and card numbers are refused."""
+    todo, skipped, missing = [], [], []
+    for f in plan:
+        value, current = f.get("value"), str(f.get("current") or "").strip()
+        if f["kind"] == "password" or PRIVATE.search(f["label"]):
+            skipped.append((f["label"], "private"))
+        elif not value:
+            missing.append(f["label"])
+        elif looks_like_card(value):
+            skipped.append((f["label"], "private"))
+        elif " ".join(current.split()).casefold() == " ".join(value.split()).casefold():
+            skipped.append((f["label"], "already filled in"))
+        else:
+            todo.append(f)
+    return todo, skipped, missing
+
+
+def fill_uia(todo: list, progress=lambda line: None, log=lambda field, outcome: None, hands=None, window=None,
+             value_of=None, still_at=None) -> tuple:
+    """Fills each field found by UI Automation, checking each one by reading it back (no screenshots).
+    Returns (labels done, why it stopped or None)."""
+    import nubbe_uia as uia
+    from look import hidden_window
+    value_of, still_at = value_of or uia.value_of, still_at or uia.still_at
+    done, f = [], None
+    with dpi_aware(), hidden_window():
+        hands = hands or Hands()
+        try:
+            for f in todo:
+                progress(f"filling: {f['label']}")
+                x, y = f["control"].center
+                if window and hands.window_at(x, y)[0] != window[0]:
+                    log(f, "stopped: another window is there now")
+                    return done, f"'{f['label']}' isn't in \"{window[1]}\" anymore (another window is there)"
+                if not still_at(f["control"]):
+                    log(f, "stopped: the page changed")
+                    return done, f"the page changed, so '{f['label']}' moved"
+                hands.click(x, y)
+                if f["current"]:
+                    hands.select_all()    # replace what's there; only inside this box
+                text = " ".join(f["value"].replace("\t", " ").split())
+                hands.type(text)
+                hands.check_stop()
+                time.sleep(0.15)
+                seen = value_of(f["control"])
+                if seen is not None and not matches(seen, text):
+                    log(f, "check failed")
+                    return done, f"'{f['label']}' doesn't look right, so I stopped to be safe"
+                log(f, "ok" if seen is not None else "ok (couldn't read it back)")
+                done.append(f["label"])
+        except Stopped as e:
+            log(f, f"stopped: {e}")
+            return done, str(e)
+    return done, None
+
+
+# ---------------------------------------------------------------------------
+# agent mode: "take care of this: ..." -> a short plan from the safe tools, shown first, run step by step
+# ---------------------------------------------------------------------------
+AGENT_MAX_STEPS = 8
+AGENT_EXTRA = {
+    "click_on": "Click one thing on screen by its name (asks Erfan first). args: {\"target\": \"...\"}",
+    "fill_form": "Fill in the form on screen (shows Erfan the plan first). args: {\"request\": \"...\"}",
+    "where_is": "Ring something on screen without clicking. args: {\"target\": \"...\"}",
+    "wait": "Wait for a page or app to load. args: {\"seconds\": 1 to 10}",
+}
+AGENT_PROMPT = """Erfan wants you to take care of this on his PC: {task}
+
+Plan it as a few steps, using only these tools:
+{tools}
+
+Reply with JSON only:
+{{"steps": [{{"tool": "open_website", "args": {{"site": "youtube", "search": "lo-fi"}}, "say": "Open YouTube and search lo-fi"}}]}}
+- At most {max} steps, in order. "say" is a short line Erfan will read.
+- After opening an app or a website, add a wait of 2 to 4 seconds before clicking or filling in it.
+- Never plan sending, buying, paying, deleting, posting or signing in: those stay Erfan's.
+- If it can't be done with these tools, reply {{"steps": [], "why": "the reason, in one short sentence"}}."""
+
+
+def agent_tools(action_schemas: list) -> dict:
+    """{tool name: one-line description} the agent may plan with."""
+    out = {}
+    for t in action_schemas:
+        fn = t["function"]
+        params = ", ".join(fn["parameters"]["properties"]) or "none"
+        out[fn["name"]] = f"{fn['description']} args: {params}"
+    return {**out, **AGENT_EXTRA}
+
+
+def plan_agent(ask_text, task: str, allowed: dict) -> tuple[list[dict], str]:
+    """(steps, why there are none). Every step is checked: known tool, args a dict, a wait of 10 s at most."""
+    tools_list = "\n".join(f"- {name}: {desc}" for name, desc in allowed.items())
+    answer = parse_json(ask_text("You plan short tasks on Erfan's PC. Reply with JSON only.",
+                                 AGENT_PROMPT.format(task=task, tools=tools_list, max=AGENT_MAX_STEPS), 900))
+    steps = []
+    for st in answer.get("steps") or []:
+        if not isinstance(st, dict) or st.get("tool") not in allowed or not isinstance(st.get("args", {}), dict):
+            return [], f"the plan had a step I can't do ({str(st.get('tool') if isinstance(st, dict) else st)[:40]})"
+        args = dict(st.get("args") or {})
+        if st["tool"] == "wait":
+            try:
+                args = {"seconds": max(0.5, min(10.0, float(args.get("seconds", 2))))}
+            except (TypeError, ValueError):
+                args = {"seconds": 2.0}
+        say = " ".join(str(st.get("say") or st["tool"].replace("_", " ")).split())[:120]
+        if NO_CLICK.search(say) and st["tool"] in ("click_on", "fill_form"):
+            return [], f"one step would need you to press something yourself ({say})"
+        steps.append({"tool": st["tool"], "args": args, "say": say})
+    if len(steps) > AGENT_MAX_STEPS:
+        return [], f"it needs more than {AGENT_MAX_STEPS} steps; try a smaller piece first"
+    return steps, ("" if steps else str(answer.get("why") or "I couldn't plan that with what I can do."))
+
+
+def agent_card(task: str, steps: list[dict]) -> dict:
+    lines = [f"{i}. {st['say']}" for i, st in enumerate(steps, 1)]
+    lines += ["", "Esc stops me. Clicking, filling forms and deleting still ask you first."]
+    return {"title": "Take care of this", "target": task[:120], "detail": "\n".join(lines),
+            "say": f"I'd do {len(steps)} step{'s' * (len(steps) != 1)}. The plan is on your screen. Say yes or no."}
+
+
+def esc_pressed() -> bool:
+    """Esc since the last check (Windows); False elsewhere."""
+    return IS_WINDOWS and bool(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8001)

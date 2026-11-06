@@ -41,6 +41,28 @@ Open a form or doc, then ask NUBB-E from the quick bar or a call: "fill this out
 
 Every step is logged in `~/.nubbe/tools.log` (field names, not what was typed). Set `hands = false` in `config.toml` to turn it off.
 
+### By name first
+
+NUBB-E first reads the real names of the buttons, links, tabs and fields in the window in front (Windows UI Automation, the same thing screen readers use). That works in Windows apps, Office, Edge, Chrome, Firefox and Electron apps. So:
+
+- **Clicking** finds "the export button" by its name, not by guessing from pixels.
+- **Filling** knows each field's label. Windows itself marks password boxes, and NUBB-E never reads what's in them. After typing, NUBB-E reads the field back to check it, with no screenshot.
+- **If an app doesn't support it,** NUBB-E falls back to the screenshot method above.
+
+### "Where's the export button?"
+
+NUBB-E puts an orange ring around it on screen for a few seconds. It never clicks, and the ring can't be clicked or take focus. Also works for "show me where the search box is" and "point to the save button".
+
+### Agent mode: "take care of this: ..."
+
+Say or type "take care of this: open YouTube and search for lo-fi, then start a 25 minute timer". NUBB-E plans a few steps (at most 8) from its safe tools: opening apps and sites, music, volume, timers, the list, notes, clicking, filling and "where's". The plan shows on a Yes/No card first. After Yes, it runs the steps one by one, with progress in the bar.
+
+- **Esc stops it** between steps.
+- **Still asks:** clicking and filling show their own cards, and deleting still asks.
+- **Never plans** sending, buying, paying, deleting, posting or signing in.
+- **Stops at the first step that fails**, so nothing later runs on a wrong assumption.
+- **Only your own words start it.** The brain can't switch agent mode on by itself.
+
 ## Everyday actions
 
 Just say or type it, in the app, the quick bar or a call:
@@ -54,6 +76,28 @@ Just say or type it, in the app, the quick bar or a call:
 - **Your PC:** "how's my laptop doing" (CPU, memory, battery, disk, GPU), "find my resume" (by name, shown in File Explorer, never opened or run).
 
 Simple commands like these are understood without the brain, so they happen in about a tenth of a second, even while the brain is asleep. Anything else goes to the brain, which can use the same actions. Opening things, sound, music, timers and notes just happen. Clearing the list or deleting a note or routine shows a Yes/No card first. "Play X on Spotify" looks the song up online (when Web is on) to start the exact track; offline it opens the search in Spotify.
+
+## Dictation and Write
+
+Hold **Right Alt** in any app, talk, and let go: your words are pasted where you were typing (Notepad, a browser text box, Word, a chat, VS Code...). A soft tick plays when the key goes down and up. A quick tap does nothing, and Esc while holding cancels.
+
+- **Modes** (the **Lists** button in the app, or say "dictation mode polished"):
+  - **Exact:** your words as heard.
+  - **Clean** (default): drops um and uh, fixes punctuation and capitals, and turns spoken "comma", "question mark", "new line" and "new paragraph" into the real thing. "Bullet milk, bullet eggs" and "number one ..., number two ..." become lists. Instant, no brain needed.
+  - **Polished:** Clean, then the brain fixes small mishearings. If the brain is asleep, takes more than 4 seconds or changes too much, you get the Clean version instead.
+- **Never changed:** links, emails, file paths, code and numbers.
+- **Spoken fixes:** "scratch that" drops the last sentence. "Let's meet at 5, no I mean 6" and "buy two apples, make that three" keep only the fix.
+- **Your words:** "spell nubby as NUBB-E" or "add Kubernetes to my dictionary", so names come out your way.
+- **Snippets:** "add a snippet called my address: 12 Main St". Then say "insert my address" while dictating.
+- **Write:** hold the key and say "write a reply saying I'll be 10 minutes late", and the brain writes it at your cursor. Select some text first and say "make this shorter", "make it more formal", "fix the grammar" or "translate this to Spanish", and the selection is rewritten in place (Ctrl+Z undoes it).
+
+**Safety:**
+- The text only goes into the window and box that had focus when you pressed the key. If you switched windows, clicked into another box, or the window closed, nothing is pasted anywhere, and a notification shows what you said, so it isn't lost.
+- Terminals and code editors get one line only, since a new line there could run a command. NUBB-E never copies from them for Write.
+- Dictation is off during a call.
+- `~/.nubbe/dictation.log` keeps timings and lengths only, never your words.
+
+Change the key in `config.toml` (`[dictation] hotkey`, like `"right ctrl"` or `"f8"`, or `""` to turn it off). Speech to text is the same Parakeet as calls, about 0.1 to 0.3 s per sentence. The mic opens the moment you press the key, so nothing is lost even while the speech models are still loading the first time.
 
 ## Voice
 

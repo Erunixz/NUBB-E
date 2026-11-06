@@ -47,6 +47,12 @@ DEFAULTS = {
         "barge_in": True,
         "say": {"Erfan": "Er-fawn", "NUBB-E": "Noobee"},
     },
+    "dictation": {
+        "hotkey": "right alt",       # hold it, talk, let go: the words are pasted where you were typing
+        "mode": "clean",             # "exact", "clean" or "polished" (also changeable in the app's Lists panel)
+        "polish_seconds": 4,         # polished: wait this long for the brain, then paste the clean version
+        "sounds": True,              # a soft tick when the key goes down and up
+    },
     "tools": {
         "workspace_dir": "*",
         "hands": True,

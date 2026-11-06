@@ -68,6 +68,17 @@ barge_in = true               # talk over NUBB-E to interrupt it (it pauses, and
 "Erfan" = "Er-fawn"
 "NUBB-E" = "Noobee"
 
+[dictation]
+# Dictate anywhere (Windows): hold the key, talk, let go, and your words are pasted where you were typing.
+# Say "write a reply saying ..." to have it written for you, or select text and say "make this shorter".
+# Keys: "right alt", "right ctrl", "right shift", "scroll lock", "pause", "insert", "f1" to "f24". "" turns it off.
+hotkey = "right alt"
+# "exact" (as heard), "clean" (drops um/uh, fixes punctuation, spoken lists; instant) or "polished"
+# (the brain also fixes small mishearings when it's awake; falls back to clean). Also in the Lists panel.
+mode = "clean"
+polish_seconds = 4     # polished: wait this long for the brain, then paste the clean version
+sounds = true          # a soft tick when the key goes down and up
+
 [tools]
 # Where NUBB-E's file tools work. "*" = the whole laptop (every drive).
 # Reading, listing and searching need no approval. Writing a file or running a command

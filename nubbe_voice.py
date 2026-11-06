@@ -30,6 +30,7 @@ Press Enter, talk, then stop talking. It answers out loud. Ctrl+C to quit.
 The app's mic button runs this script with --serve (commands on stdin).
 """
 import argparse
+import base64
 import json
 import os
 import queue
@@ -197,7 +198,10 @@ class Parakeet:
         return str(self.model.recognize(np.asarray(audio, np.float32), sample_rate=MIC_RATE)).strip()
 
 
-def transcribe(model, audio: np.ndarray) -> str:
+DICTATION_NOISE = {"you", "the", "uh", "um", "hmm", "oh"}   # dictation keeps "Thanks." and "Okay."
+
+
+def transcribe(model, audio: np.ndarray, noise: set = NOISE_GUESSES) -> str:
     peak = float(np.abs(audio).max()) if audio.size else 0.0
     if 0 < peak < 0.5:
         audio = audio * (0.5 / peak)      # quiet mic: bring it up to a normal level, both ears hear much better
@@ -209,7 +213,7 @@ def transcribe(model, audio: np.ndarray) -> str:
         # skip bits Whisper itself isn't sure were speech (noise, a click, NUBB-E's own echo)
         text = " ".join(s.text.strip() for s in segments
                         if s.no_speech_prob < 0.6 and s.avg_logprob > -1.0).strip()
-    if text.lower().strip(" .!?,") in NOISE_GUESSES:
+    if text.lower().strip(" .!?,") in noise:
         return ""                         # the usual guesses on noise or a breath
     return fix_names(text)
 
@@ -852,6 +856,32 @@ def wake_rest(text: str) -> str | None:
     return text[m.end():].strip() if m else None
 
 
+def dictated(stt, line: str) -> None:
+    """"transcribe <id> <base64 16-bit audio>" from the app (the dictation key): the words go back to the
+    app with the secret token. Only timings are printed, never the words."""
+    try:
+        _, rid, data = line.split(" ", 2)
+        audio = np.frombuffer(base64.b64decode(data), np.int16).astype(np.float32) / 32768
+    except ValueError:
+        print("(dictation: bad audio from the app)", flush=True)
+        return
+    t0 = time.time()
+    try:
+        text = transcribe(stt, audio, DICTATION_NOISE) if audio.size else ""
+    except Exception as e:
+        print(f"(dictation: couldn't turn it into words: {type(e).__name__})", flush=True)
+        text = ""
+    ms = (time.time() - t0) * 1000
+    print(f"(dictation: {len(audio) / MIC_RATE:.1f} s of audio in {ms:.0f} ms)", flush=True)
+    try:
+        req = urllib.request.Request(APP_URL.replace("/api/chat", "/api/dictated"),
+                                     data=json.dumps({"token": VOICE_TOKEN, "id": rid, "text": text, "ms": ms}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).close()
+    except (urllib.error.URLError, OSError) as e:
+        print(f"(dictation: couldn't reach the app: {e})", flush=True)
+
+
 def tell_app_to_wake() -> None:
     """Heard "Hey NUBB-E": the app starts loading the brain now, while the rest is still being said."""
     try:
@@ -1106,7 +1136,9 @@ def serve(stt, st: dict, speak_q, threshold: float) -> None:
     listen = push-to-talk turn, or stop recording early if already listening.
     stop   = stop listening / stop talking (ends a call too).   quit = exit.
     wake_on / wake_off = listen for "Hey NUBB-E" in between (paused during a call or a push-to-talk turn).
-    say <text> = say this out loud now (timers and reminders)."""
+    say <text> = say this out loud now (timers and reminders).
+    dictate_start = the dictation key is down (the app records): pause "Hey NUBB-E" and stop talking.
+    dictate_cancel = it was only a tap.   transcribe <id> <audio> = turn the dictation into words."""
     stop = threading.Event()
     busy = threading.Event()
     call: list[Call] = []
@@ -1131,6 +1163,12 @@ def serve(stt, st: dict, speak_q, threshold: float) -> None:
             busy.clear()
             start_wake()
 
+    def dictation(line):
+        try:
+            dictated(stt, line)
+        finally:
+            start_wake()
+
     def end_call():
         if call:
             c = call.pop()
@@ -1148,6 +1186,18 @@ def serve(stt, st: dict, speak_q, threshold: float) -> None:
             if not GENERATING.is_set():
                 HUSH.clear()
             speak_q.put(cmd[4:])
+            continue
+        if cmd == "dictate_start":        # the app records while the key is held
+            if not call:
+                stop_wake()
+                if SPEAKING.is_set() or GENERATING.is_set():
+                    hush(speak_q)
+            continue
+        if cmd == "dictate_cancel":
+            start_wake()
+            continue
+        if cmd.startswith("transcribe "):
+            threading.Thread(target=dictation, args=(cmd,), daemon=True).start()
             continue
         if call and call[0].done.is_set():
             call.clear()                  # the last call ended by itself (e.g. mic problem)

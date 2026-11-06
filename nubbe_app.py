@@ -81,6 +81,8 @@ import nubbe_web as web                       # web search and page reading, onl
 import nubbe_hands as hands                   # fills in forms on screen after a Yes (keep next to this file)
 import nubbe_actions as actions               # apps, volume, music, timers, reminders, the list, notes, routines
 import nubbe_desk as desk                     # the Windows side of those actions
+import nubbe_dictate as dictate               # hold Right Alt to dictate anywhere, and Write
+import nubbe_uia as uia                       # the real names of buttons and fields on screen (Windows)
 
 VOICE_RULES = (
     "\n\n## Voice call\n"
@@ -140,6 +142,7 @@ VOICE_TOKEN = secrets.token_hex(16)   # only the voice helper we start knows it:
 APP_HOOKS = {"show_quick": None, "show_main": None}
 MAX_TOOL_ROUNDS = 6         # tool calls per reply before NUBB-E has to answer
 CONFIRM_SECONDS = 300       # a Yes/No card with no answer counts as No
+RING_SECONDS = 4            # "where's the export button?": how long the ring stays
 PENDING: dict[str, dict] = {}   # confirmation card id -> {"event", "ok"}
 
 
@@ -184,7 +187,7 @@ def init_db() -> None:
 
 
 def get_settings() -> dict:
-    return {r["key"]: r["value"] == "1" for r in rows("SELECT key, value FROM settings")}
+    return {r["key"]: r["value"] == "1" for r in rows("SELECT key, value FROM settings") if r["key"] in DEFAULT_SETTINGS}
 
 
 def web_allowed() -> bool:
@@ -215,9 +218,10 @@ def action_weather() -> str | None:
     return text if 0 < len(text) < 60 and "<" not in text else None
 
 
-ACTIONS = actions.Actions(lambda: connect(), web_search=action_search, weather=action_weather)
+ACTIONS = actions.Actions(lambda: connect(), web_search=action_search, weather=action_weather,
+                          dictation_mode=str(CFG["dictation"]["mode"]).lower())
 LIST_ACTIONS = {"add_todo", "done_todo", "clear_todos", "add_note", "delete_note", "set_timer", "set_reminder",
-                "cancel_reminder", "make_routine", "delete_routine"}
+                "cancel_reminder", "make_routine", "delete_routine"} | actions.RULE_ONLY
 
 
 def title_from(text: str) -> str:
@@ -421,7 +425,7 @@ def setup(slot: int, chat_id=None) -> tuple[str, list | None]:
     if slot == VOICE_SLOT:
         system += VOICE_RULES
     offered = ((tools.SCHEMAS if files else []) + (web.SCHEMAS if net else []) + actions.SCHEMAS
-               + ([hands.SCHEMA, hands.CLICK_SCHEMA] if HANDS else []))
+               + ([hands.SCHEMA, hands.CLICK_SCHEMA, hands.WHERE_SCHEMA] if HANDS else []))
     return system, offered or None
 
 
@@ -468,7 +472,7 @@ class Voice:
                 self.in_call = False
             if self.proc is None or self.proc.poll() is not None:
                 self.in_call = self.in_call and cmd == "call"
-                if cmd not in ("listen", "call", "wake_on") and not cmd.startswith("say "):
+                if cmd not in ("listen", "call", "wake_on", "dictate_start") and not cmd.startswith(("say ", "transcribe ")):
                     return "off"
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
                 if self.log:
@@ -493,7 +497,7 @@ class Voice:
             try:
                 self.proc.stdin.write(cmd + "\n")
                 self.proc.stdin.flush()
-            except OSError:
+            except (OSError, ValueError):
                 return "off"
             return status
 
@@ -515,6 +519,47 @@ class Voice:
 
 VOICE = Voice()
 BRAIN.busy = lambda: VOICE.in_call
+
+
+DICTATION: "dictate.Dictation | None" = None   # set up in main() on Windows (hold Right Alt to dictate)
+
+
+def ask_text(system: str, user: str, max_tokens: int) -> str:
+    """One plain answer from the brain, no thinking (dictation's polished mode and Write)."""
+    with BRAIN.use():
+        return "".join(v for k, v in llm_stream([{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                                think=False, max_tokens=max_tokens, temperature=0.3,
+                                                slot=MEMORY_SLOT) if k == "content")
+
+
+def start_dictation() -> None:
+    """Hold the dictation key (Right Alt by default) in any app, talk, let go: the words are pasted there."""
+    global DICTATION
+    cfg = CFG["dictation"]
+    try:
+        vk = dictate.parse_hold_key(cfg["hotkey"])
+    except ValueError as e:
+        print(e)
+        return
+    if vk is None or sys.platform != "win32":
+        return
+    vocab = lambda: (lambda d: (d["words"], d["snippets"]))(ACTIONS.dictation())   # noqa: E731
+
+    def notify(title, text):
+        desk.notify(title, text)
+        broadcast({"event": "reminder", "text": f"{title}: {text}"})
+
+    DICTATION = dictate.Dictation(
+        send=VOICE.send, ask=ask_text, mode=lambda: ACTIONS.dictation()["mode"], vocab=vocab, notify=notify,
+        status=lambda state, line: broadcast({"state": state, "status": line}), log_path=DATA_DIR / "dictation.log",
+        in_call=lambda: VOICE.in_call, wake_brain=BRAIN.wake, brain_ready=llm_alive,
+        ensure_brain=lambda: BRAIN.ensure(on_wait=lambda: broadcast({"state": "sleep", "status": "waking up"}),
+                                          timeout=180),
+        polish_seconds=float(cfg.get("polish_seconds", 4)),
+        cues=(lambda name: dictate.play_cue(name, DATA_DIR / "cues")) if cfg.get("sounds", True) else None)
+    dictate.HoldKey(vk, DICTATION.press, DICTATION.release).start()
+    print(f"Dictation ready: hold {cfg['hotkey']} in any app, talk, and let go "
+          f"({ACTIONS.dictation()['mode']} mode).")
 
 
 def fire_reminder(r: dict) -> None:
@@ -557,7 +602,11 @@ def lists_now() -> dict:
             "notes": rows("SELECT id, text, created FROM notes ORDER BY id DESC LIMIT 100"),
             "reminders": [{**r, "left": r["due"] - time.time(),
                            "when": actions.say_time(datetime.fromtimestamp(r["due"]))}
-                          for r in rows("SELECT id, text, due, kind FROM reminders WHERE fired = 0 ORDER BY due")]}
+                          for r in rows("SELECT id, text, due, kind FROM reminders WHERE fired = 0 ORDER BY due")],
+            "dictation": {"mode": ACTIONS.dictation()["mode"], "on": DICTATION is not None,
+                          "hotkey": str(CFG["dictation"]["hotkey"]),
+                          "words": rows("SELECT heard, written FROM dict_words ORDER BY lower(written)"),
+                          "snippets": rows("SELECT name, text FROM snippets ORDER BY name")}}
 
 
 def system_prompt(chat_id=None) -> str:
@@ -864,6 +913,13 @@ class Handler(BaseHTTPRequestHandler):
             if ok:
                 webbrowser.open(url)
             self.send_json({"ok": ok})
+        elif path == "/api/dictated":    # the voice helper's words for a dictation (only it knows the token)
+            if body.get("token") != VOICE_TOKEN or DICTATION is None:
+                self.send_error(403)
+                return
+            ms = body.get("ms")
+            self.send_json({"ok": DICTATION.heard(str(body.get("id", "")), str(body.get("text") or ""),
+                                                  float(ms) if isinstance(ms, (int, float)) else 0)})
         elif path == "/api/confirm":     # Erfan pressed Yes or No on a tool card
             card = PENDING.get(str(body.get("id", "")))
             if not card and body.get("token") == VOICE_TOKEN:   # or said it out loud on a call
@@ -920,6 +976,16 @@ class Handler(BaseHTTPRequestHandler):
             run("DELETE FROM notes WHERE id = ?", (item_id,))
         elif action == "cancel_reminder" and isinstance(item_id, int):
             run("DELETE FROM reminders WHERE id = ? AND fired = 0", (item_id,))
+        elif action == "dictation_mode" and body.get("mode") in actions.DICTATION_MODES:
+            ACTIONS.call("dictation_mode", {"mode": body["mode"]})
+        elif action == "add_word" and str(body.get("written", "")).strip():
+            ACTIONS.call("add_word", {"written": str(body["written"]), "heard": str(body.get("heard") or "") or None})
+        elif action == "delete_word" and str(body.get("heard", "")):
+            run("DELETE FROM dict_words WHERE heard = ?", (str(body["heard"]),))
+        elif action == "add_snippet" and str(body.get("name", "")).strip() and str(body.get("text", "")).strip():
+            ACTIONS.call("add_snippet", {"name": str(body["name"]), "text": str(body["text"])})
+        elif action == "delete_snippet" and str(body.get("name", "")):
+            run("DELETE FROM snippets WHERE name = ?", (str(body["name"]),))
         else:
             self.send_error(400)
             return
@@ -1026,9 +1092,14 @@ class Handler(BaseHTTPRequestHandler):
                         "My brain isn't running. Start llama-server, or start me without --no-brain.")})
                     return
                 self.final = None   # a tool's own last word (filling a form), said instead of another brain round
-                # "fill this out" goes straight to the hands: the model doesn't always pick the tool by itself
-                fast = HANDS and not look and ("fill_form" if hands.wants_fill(text) else
-                                                "click_on" if hands.wants_click(text) else None)
+                # "fill this out" goes straight to the hands: the model doesn't always pick the tool by itself.
+                # "take care of this: ..." goes to agent mode (only from Erfan's own words, never the model's)
+                task = None if look else hands.agent_task(text)
+                fast = ("agent_task" if task and hands.IS_WINDOWS else
+                        None if not HANDS or look else
+                        "fill_form" if hands.wants_fill(text) else "where_is" if hands.wants_where(text) else
+                        "click_on" if hands.wants_click(text) else None)
+                self.fast = fast
                 for rnd in range(MAX_TOOL_ROUNDS + 1):   # the last round has no tools, so it must answer
                     calls, said = [], ""
                     if offered and not web.online():     # the internet dropped mid-reply: no more retrying
@@ -1037,7 +1108,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.offered_now = {t["function"]["name"] for t in (offered or [])} if rnd < MAX_TOOL_ROUNDS else set()
                     if fast and rnd == 0:
                         calls = [{"id": "call_hands", "type": "function", "function": {
-                            "name": fast, "arguments": json.dumps({"request": text, "target": text})}}]
+                            "name": fast, "arguments": json.dumps({"task": task} if fast == "agent_task" else
+                                                                  {"request": text, "target": text})}}]
                     for kind, val in ([] if calls else llm_stream(
                             messages, think=think, max_tokens=120 if voice else None, slot=slot,
                             tools=offered if rnd < MAX_TOOL_ROUNDS else None)):
@@ -1143,8 +1215,12 @@ class Handler(BaseHTTPRequestHandler):
             # file tools on a voice call, hands with vision off
             tools.log(DATA_DIR / "tools.log", name, {}, "not offered")
             return f"{name} isn't available right now."
+        if name == "agent_task" and getattr(self, "fast", None) != "agent_task":
+            tools.log(DATA_DIR / "tools.log", name, {}, "not offered")    # only Erfan's own "take care of this"
+            return f"{name} isn't available right now."
         line = (web.status(name, args) if name in web.TOOLS else "looking at the form" if name == "fill_form"
-                else "looking for it on the screen" if name == "click_on"
+                else "looking for it on the screen" if name in ("click_on", "where_is")
+                else "planning the steps" if name == "agent_task"
                 else actions.status(name, args) if name in actions.TOOLS else tools.status(name, args))
         self.emit({"type": "tool", "name": name, "text": line})
         broadcast({"state": "thinking", "status": line[:60]})
@@ -1152,10 +1228,13 @@ class Handler(BaseHTTPRequestHandler):
             return web.call(name, args, DATA_DIR / "web.log")
         if name in actions.TOOLS:
             return self.run_action(name, args)
+        if name == "agent_task":
+            return self.agent(args)
         if name in hands.TOOLS:
             if not HANDS:
                 return "Using the screen needs vision (mmproj in config.toml) on Windows."
-            return self.fill_form(args) if name == "fill_form" else self.click_on(args)
+            return (self.fill_form(args) if name == "fill_form" else self.where_is(args) if name == "where_is"
+                    else self.click_on(args))
         approved = None
         if tools.needs_yes(name) and name in tools.TOOLS:
             approved = self.ask_yes(tools.card(name, args))
@@ -1195,6 +1274,28 @@ class Handler(BaseHTTPRequestHandler):
             self.final = text
             return text
 
+        uia_plan, window = None, None
+        got = hands.front_controls()            # UI Automation first: the real fields, by name
+        if got:
+            window = got[0]
+            if hands.NO_TYPING.search(window[1]):
+                return finish(f"I won't type there: \"{window[1]}\" looks like a terminal or code editor, and typing "
+                              "there could run commands.", "refused: terminal or code editor")
+            try:
+                uia_plan = hands.plan_form_uia(ask_text, request or self.asked, facts, window, got[1])
+            except (ValueError, OSError) as e:
+                uia_plan = None
+                print(f"(couldn't plan the form from its fields: {e}; using the screenshot instead)")
+        if uia_plan:
+            todo, skipped, missing = hands.review_uia(uia_plan)
+            tools.log(log_file, "fill_form", {"request": request}, f"plan (by name): {len(todo)} to fill, "
+                      f"{len(skipped)} skipped, {len(missing)} missing")
+            if not todo:
+                return finish(hands.report([], None, [], skipped, missing))
+            if not self.ask_yes(hands.card(todo, skipped, missing, window[1])):
+                return finish("Okay, I didn't type anything.", "declined")
+            done, stopped = hands.fill_uia(todo, self.hands_progress, self.hands_log, window=window)
+            return finish(hands.report(done, stopped, todo, skipped, missing))
         try:
             plan = hands.plan_form(ask_vision, request or self.asked, facts)
         except (ValueError, OSError, ImportError) as e:
@@ -1211,14 +1312,15 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ask_yes(hands.card(todo, skipped, missing, window[1])):
             return finish("Okay, I didn't type anything.", "declined")
 
-        def progress(line):
-            self.safe_emit({"type": "tool", "name": "fill_form", "text": line})
-            broadcast({"state": "thinking", "status": line[:60]})
-
-        def log(field, outcome):
-            tools.log(log_file, "fill_field", {"field": field["label"], "content": field["value"]}, outcome)
-        done, stopped = hands.fill(todo, ask_vision, progress, log, window=window)
+        done, stopped = hands.fill(todo, ask_vision, self.hands_progress, self.hands_log, window=window)
         return finish(hands.report(done, stopped, todo, skipped, missing))
+
+    def hands_progress(self, line):
+        self.safe_emit({"type": "tool", "name": "fill_form", "text": line})
+        broadcast({"state": "thinking", "status": line[:60]})
+
+    def hands_log(self, field, outcome):
+        tools.log(DATA_DIR / "tools.log", "fill_field", {"field": field["label"], "content": field["value"]}, outcome)
 
     def click_on(self, args: dict) -> str:
         """Hands: find one thing on screen, ask, and click it."""
@@ -1230,15 +1332,111 @@ class Handler(BaseHTTPRequestHandler):
             self.final = text
             return text
         try:
-            spot, window = hands.review_click(hands.plan_click(ask_vision, target), target)
+            hit = hands.find_control(target)        # UI Automation first: by its real name
+            if hit:
+                spot, window = hands.review_control(hit[0], target, hit[1]), hit[1]
+            else:
+                spot, window = hands.review_click(hands.plan_click(ask_vision, target), target)
         except hands.TargetError as e:
             return finish(f"{str(e)[0].upper()}{str(e)[1:]}.", f"refused: {e}")
         except (ValueError, OSError, ImportError) as e:
             return finish(f"I couldn't read the screen ({e}).", f"error: {e}")
         if not self.ask_yes(hands.click_card(spot, window)):
             return finish("Okay, I didn't click anything.", "declined")
-        result = hands.click(spot, window)
-        return finish(result, "ok" if result.startswith("Done") else result)
+        result = hands.click_control(spot, window) if "control" in spot else hands.click(spot, window)
+        return finish(result, "ok (by name)" if hit and result.startswith("Done") else
+                      "ok" if result.startswith("Done") else result)
+
+    def where_is(self, args: dict) -> str:
+        """Hands: "where's the export button?" A ring around it for a few seconds. Never clicks, so no card."""
+        target = hands.clean_target(" ".join(str(args.get("target") or self.asked).split()))
+
+        def finish(text, outcome):
+            tools.log(DATA_DIR / "tools.log", "where_is", {"target": target}, outcome)
+            self.final = text
+            return text
+        hit = hands.find_control(target)
+        if hit:
+            c = hit[0]
+            uia.ring(c.rect, RING_SECONDS)
+            return finish(f"There it is: I put an orange ring around {c.name or 'it'} ({c.kind}) for a few seconds.",
+                          "found (by name)")
+        try:
+            found = hands.plan_click(ask_vision, target)
+        except (ValueError, OSError, ImportError) as e:
+            return finish(f"I couldn't read the screen ({e}).", f"error: {e}")
+        box = hands._box(found.get("box")) if found.get("found") else None
+        if not box:
+            return finish(f"I can't see {target} on the screen.", "not found")
+        with hands.dpi_aware():
+            h = hands.Hands()
+            left, top, width, height = h.screen()
+        rect = (round(left + box[0] / 1000 * width), round(top + box[1] / 1000 * height),
+                round(left + box[2] / 1000 * width), round(top + box[3] / 1000 * height))
+        uia.ring(rect, RING_SECONDS)
+        label = " ".join(str(found.get("label") or target).split())[:80]
+        return finish(f"There it is: I put an orange ring around {label} for a few seconds.", "found (screenshot)")
+
+    def agent(self, args: dict) -> str:
+        """Agent mode: plan a few steps from the safe tools, show the plan, run them one by one. Esc stops it.
+        Clicks and forms still show their own cards, and deleting still asks."""
+        task = " ".join(str(args.get("task") or "").split())
+
+        def finish(text, outcome):
+            tools.log(DATA_DIR / "tools.log", "agent_task", {"task": task}, outcome)
+            self.final = text
+            return text
+        allowed = hands.agent_tools(actions.SCHEMAS)
+        if not HANDS:
+            for name in ("click_on", "fill_form", "where_is"):
+                allowed.pop(name, None)
+        if not web_allowed():
+            allowed.pop("play_music", None)
+        try:
+            steps, why = hands.plan_agent(ask_text, task, allowed)
+        except (ValueError, OSError) as e:
+            return finish(f"I couldn't plan that ({e}).", f"error: {e}")
+        if not steps:
+            return finish(f"I can't take care of that one: {why}.", f"no plan: {why}")
+        if not self.ask_yes(hands.agent_card(task, steps)):
+            return finish("Okay, I didn't do anything.", "declined")
+        hands.esc_pressed()                         # forget an old Esc press
+        results = []
+        for i, st in enumerate(steps, 1):
+            if hands.esc_pressed():
+                results.append(f"Stopped before step {i} because you pressed Esc.")
+                break
+            line = f"step {i} of {len(steps)}: {st['say']}"
+            self.safe_emit({"type": "tool", "name": "agent_task", "text": line})
+            broadcast({"state": "thinking", "status": line[:60]})
+            self.final = None
+            if st["tool"] == "wait":
+                end, stopped = time.time() + st["args"]["seconds"], False
+                while time.time() < end:
+                    if hands.esc_pressed():
+                        stopped = True
+                        break
+                    time.sleep(0.1)
+                if stopped:
+                    results.append(f"Stopped at step {i} because you pressed Esc.")
+                    break
+                continue
+            if st["tool"] in actions.TOOLS:
+                out = self.run_action(st["tool"], st["args"])
+            elif st["tool"] == "click_on":
+                out = self.click_on(st["args"])
+            elif st["tool"] == "fill_form":
+                out = self.fill_form(st["args"])
+            else:
+                out = self.where_is(st["args"])
+            results.append(f"{i}. {out}")
+            if re.match(r"(?:okay, i didn't|i didn't|i couldn't|i can't|i won't|i stopped|there's no|"
+                        r"that didn't work|erfan said no|not allowed)", out.strip(), re.IGNORECASE):
+                results.append("I stopped there, so nothing after it ran.")
+                break
+        tools.log(DATA_DIR / "tools.log", "agent_task", {"task": task}, f"ran {len(results)} of {len(steps)} steps")
+        self.final = None
+        return finish("\n".join(results) or "Done.", "done")
 
     def safe_emit(self, obj):
         try:
@@ -1410,6 +1608,7 @@ def main() -> None:
     threading.Thread(target=BRAIN.watch_idle, daemon=True).start()
     threading.Thread(target=watch_reminders, daemon=True).start()   # timers and reminders, even in the background
     desk.warm_up()                                                  # read the Start menu once, so "open X" is instant
+    start_dictation()
     if str(CFG["voice"].get("wake_phrase", False)).lower() in ("true", "1", "yes", "on"):
         print('Listening for "Hey NUBB-E" (wake_phrase in config.toml).')
         threading.Thread(target=VOICE.send, args=("wake_on",), daemon=True).start()
@@ -1543,6 +1742,9 @@ PAGE = r"""<!doctype html>
   .item.done span { text-decoration: line-through; color: var(--muted); }
   .item button { color: var(--muted); }
   .item button:hover { color: #ff8a8a; }
+  .modes { display: flex; gap: 6px; }
+  .modes button { flex: 1; padding: 7px; border-radius: 8px; border: 1px solid var(--line); background: #16202a; color: var(--muted); }
+  .modes button.on { background: #1f3b52; color: var(--text); border-color: #3d7bab; }
   .item input[type=checkbox] { accent-color: var(--glow); }
   .msg.reminder { align-self: center; border: 1px solid var(--glow); color: var(--glow); border-radius: 12px; padding: 8px 14px; }
 </style>
@@ -1594,6 +1796,18 @@ PAGE = r"""<!doctype html>
     <div class="list-sec"><h3>Notes</h3>
       <div class="mem-add"><input id="noteInput" placeholder="Write a note, or type to search them"><button class="send" id="noteAdd">Save</button></div>
       <div id="noteList" style="margin-top:8px"></div></div>
+    <div class="list-sec"><h3>Dictation</h3>
+      <p id="dictHelp"></p>
+      <div class="modes" id="dictModes">
+        <button data-mode="exact" title="Your words as heard">Exact</button>
+        <button data-mode="clean" title="No ums, tidy punctuation, spoken lists. Instant">Clean</button>
+        <button data-mode="polished" title="The brain also fixes small mishearings (when it's awake)">Polished</button></div>
+      <div class="mem-add" style="margin-top:8px"><input id="wordHeard" placeholder="Heard as (optional)">
+        <input id="wordWritten" placeholder="Write it like this"><button class="send" id="wordAdd">Add word</button></div>
+      <div id="wordList" style="margin-top:8px"></div>
+      <div class="mem-add" style="margin-top:8px"><input id="snipName" placeholder="Snippet name, like address">
+        <input id="snipText" placeholder="Text it types"><button class="send" id="snipAdd">Add snippet</button></div>
+      <div id="snipList" style="margin-top:8px"></div></div>
   </div>
 </div>
 
@@ -1868,8 +2082,29 @@ function drawLists() {
   for (const n of shown)
     notes.appendChild(itemEl(n.text, new Date(n.created * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
       [['&times;', 'Delete', () => { if (confirm('Delete this note?')) listDo({ action: 'delete_note', id: n.id }); }]]));
+  const dic = lists.dictation;
+  if (dic) {
+    $('dictHelp').textContent = dic.on
+      ? 'Hold ' + dic.hotkey + ' in any app, talk, and let go. Say "write a reply saying ..." to have it written, ' +
+        'or select text and say "make this shorter". Snippets: say "insert my address".'
+      : 'Dictation is off (hotkey in config.toml, Windows only).';
+    for (const b of $('dictModes').children) b.classList.toggle('on', b.dataset.mode === dic.mode);
+    const words = $('wordList'); words.innerHTML = dic.words.length ? '' : '<p>No words yet. Add names and words to spell your way.</p>';
+    for (const w of dic.words)
+      words.appendChild(itemEl(w.written, w.heard === w.written.toLowerCase() ? '' : 'heard as ' + w.heard,
+        [['&times;', 'Remove', () => listDo({ action: 'delete_word', heard: w.heard })]]));
+    const snips = $('snipList'); snips.innerHTML = dic.snippets.length ? '' : '<p>No snippets yet.</p>';
+    for (const n of dic.snippets)
+      snips.appendChild(itemEl(n.text, 'insert my ' + n.name,
+        [['&times;', 'Delete', () => { if (confirm('Delete this snippet?')) listDo({ action: 'delete_snippet', name: n.name }); }]]));
+  }
 }
 async function loadLists() { lists = await api('/api/lists'); drawLists(); }
+for (const b of $('dictModes').children) b.onclick = () => listDo({ action: 'dictation_mode', mode: b.dataset.mode });
+$('wordAdd').onclick = () => { const w = $('wordWritten').value.trim(), h = $('wordHeard').value.trim();
+  if (w) { $('wordWritten').value = $('wordHeard').value = ''; listDo({ action: 'add_word', written: w, heard: h }); } };
+$('snipAdd').onclick = () => { const n = $('snipName').value.trim(), t = $('snipText').value.trim();
+  if (n && t) { $('snipName').value = $('snipText').value = ''; listDo({ action: 'add_snippet', name: n, text: t }); } };
 $('openLists').onclick = () => { $('listPanel').classList.add('open'); loadLists(); };
 $('closeLists').onclick = () => $('listPanel').classList.remove('open');
 $('listPanel').onclick = e => { if (e.target.id === 'listPanel') $('listPanel').classList.remove('open'); };

@@ -23,5 +23,8 @@ winrt-Windows.Media.Control
 winrt-Windows.Foundation
 winrt-Windows.Foundation.Collections
 
+# Hands (Windows): read button and field names with UI Automation. Without it, the screenshot method is used.
+comtypes
+
 # tests only
 pytest
